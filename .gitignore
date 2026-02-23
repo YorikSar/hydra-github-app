@@ -1,0 +1,12 @@
+# development outputs
+/target
+/result
+# development environment
+/.direnv
+# test inputs
+/config.json
+/cookies
+/envfile
+/generate_jwt.sh
+/private-key.pem
+/secret

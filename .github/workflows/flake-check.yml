@@ -1,0 +1,23 @@
+name: flake-check
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  nix-check:
+    name: nix-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: hydra-github-app
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
+      - name: nix flake check
+        run: nix flake check --print-build-logs --no-update-lock-file
