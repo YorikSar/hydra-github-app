@@ -3,7 +3,7 @@
   rustPlatform,
 }:
 rustPlatform.buildRustPackage {
-  name = "gh-app";
+  name = "hydra-github-app";
 
   src = lib.fileset.toSource {
     root = ./.;
