@@ -361,6 +361,32 @@ mod github {
             );
             Ok((resp.token, resp.expires_at))
         }
+
+        async fn get_installation_for_repo(&self, repo_full_name: &str) -> Result<u64> {
+            #[derive(serde::Deserialize)]
+            struct Response {
+                id: u64,
+            }
+            Ok(self
+                .http_client
+                .get(format!(
+                    "https://api.github.com/repos/{repo_full_name}/installation",
+                ))
+                .bearer_auth(&self.get_token().await)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("failed to send an installation request for {repo_full_name}")
+                })?
+                .error_for_status()
+                .with_context(|| format!("installation request for {repo_full_name} failed"))?
+                .json::<Response>()
+                .await
+                .with_context(|| {
+                    format!("failed to parse installation response for {repo_full_name}")
+                })?
+                .id)
+        }
     }
 
     #[derive(Clone)]
@@ -555,7 +581,6 @@ mod github {
     #[derive(Clone)]
     pub struct Client {
         http_client: reqwest::Client,
-        #[allow(dead_code)]
         application_client: ApplicationClient,
         token_channel: mpsc::Sender<(u64, oneshot::Sender<Result<String>>)>,
     }
@@ -628,12 +653,21 @@ mod github {
             rx.await.expect("failed to receive response")
         }
 
-        pub async fn installation(&self, installation_id: u64) -> Result<InstallationClient> {
+        pub async fn for_installation(&self, installation_id: u64) -> Result<InstallationClient> {
             Ok(InstallationClient {
                 http_client: self.http_client.clone(),
                 installation_id,
                 token: self.get_installation_token(installation_id).await?,
             })
+        }
+
+        pub async fn for_repo(&self, repo_full_name: &str) -> Result<InstallationClient> {
+            // TODO: cache responses
+            let installation_id = self
+                .application_client
+                .get_installation_for_repo(repo_full_name)
+                .await?;
+            self.for_installation(installation_id).await
         }
     }
 
@@ -1069,12 +1103,11 @@ mod hydra {
     }
 }
 
-fn parse_jobset_name(jobset_name: &str) -> Option<(u64, u64, String)> {
+fn parse_jobset_name(jobset_name: &str) -> Option<(u64, String)> {
     let mut parts = jobset_name.split("-");
     if parts.next()? != "pr" {
         return None;
     }
-    let installation_id = parts.next()?.parse().ok()?;
     let pr_number = parts.next()?.parse().ok()?;
     let commit_sha = parts.next()?;
     if commit_sha.len() != 40 || commit_sha.find(|c: char| !c.is_ascii_hexdigit()).is_some() {
@@ -1084,21 +1117,17 @@ fn parse_jobset_name(jobset_name: &str) -> Option<(u64, u64, String)> {
     if parts.next().is_some() {
         return None;
     }
-    Some((installation_id, pr_number, commit_sha.to_string()))
+    Some((pr_number, commit_sha.to_string()))
 }
 
 #[test]
 fn test_parse_jobset_name() {
     assert_eq!(
-        parse_jobset_name(&"pr-102899660-1-90640e3953b7ed1d1ccf9b888d60009ff22fdf5a".to_string()),
-        Some((
-            102899660,
-            1,
-            "90640e3953b7ed1d1ccf9b888d60009ff22fdf5a".to_string()
-        )),
+        parse_jobset_name("pr-1-90640e3953b7ed1d1ccf9b888d60009ff22fdf5a"),
+        Some((1, "90640e3953b7ed1d1ccf9b888d60009ff22fdf5a".to_string())),
     );
     assert_eq!(
-        parse_jobset_name(&"pr-102899660-1-90640e3953b7ed1d1ccf9b888d60009ff22fdf5".to_string()),
+        parse_jobset_name("pr-1-90640e3953b7ed1d1ccf9b888d60009ff22fdf5"),
         None,
     );
 }
@@ -1124,11 +1153,10 @@ async fn sync_hydra_jobsets(
             //eprintln!("got project {}: {project:?}", config.hydra_project);
             for jobset_name in project.jobsets {
                 let _ = async {
-                    let (installation_id, _pr_number, commit_sha) =
-                        match parse_jobset_name(&jobset_name) {
-                            Some(x) => x,
-                            None => return Ok::<(), anyhow::Error>(()),
-                        };
+                    let (_pr_number, commit_sha) = match parse_jobset_name(&jobset_name) {
+                        Some(x) => x,
+                        None => return Ok::<(), anyhow::Error>(()),
+                    };
                     let jobset = hydra_client
                         .get_jobset(&config.hydra_project, &jobset_name)
                         .await?;
@@ -1136,12 +1164,14 @@ async fn sync_hydra_jobsets(
                         return Ok(());
                     }
                     eprintln!("got jobset: {jobset_name}");
-                    let installation_client = github_client.installation(installation_id).await?;
 
-                    let repository_name_input = jobset
+                    let repository_name = &jobset
                         .inputs
                         .get("repository_name")
-                        .ok_or_else(|| anyhow!("repository_name input not found"))?;
+                        .ok_or_else(|| anyhow!("repository_name input not found"))?
+                        .value;
+
+                    let installation_client = github_client.for_repo(repository_name).await?;
 
                     let data = 'data: {
                         use github::CheckRunConclusion::*;
@@ -1219,7 +1249,7 @@ async fn sync_hydra_jobsets(
                         installation_client,
                         config.app_id,
                         &config.check_run_name,
-                        &repository_name_input.value,
+                        repository_name,
                         &commit_sha,
                         &data,
                     )
@@ -1314,7 +1344,8 @@ async fn handle_payload(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            if let Ok(installation_client) = github_client.installation(event.installation.id).await
+            if let Ok(installation_client) =
+                github_client.for_installation(event.installation.id).await
             {
                 for r in event.repositories {
                     eprintln!("will configure check suite preferences for {}", r.full_name);
@@ -1365,7 +1396,7 @@ async fn handle_payload(
                 break 'pr;
             }
             let installation_client = github_client
-                .installation(event.installation.id)
+                .for_installation(event.installation.id)
                 .await
                 .context("couldn't get installation client")
                 .map_err(Error::reject_internal)?;
@@ -1379,8 +1410,8 @@ async fn handle_payload(
             .context("failed to wait for the merge commit")
             .map_err(Error::reject_internal)?;
             let jobset_id = format!(
-                "pr-{}-{}-{}",
-                event.installation.id, event.pull_request.number, event.pull_request.head.sha
+                "pr-{}-{}",
+                event.pull_request.number, event.pull_request.head.sha
             );
             let mut jobset = config.hydra_jobset_template.clone();
             // String::replace_first is only in nightly
@@ -1402,13 +1433,6 @@ async fn handle_payload(
                     _ => {}
                 };
             }
-            jobset
-                .inputs
-                .entry("installation_id".to_string())
-                .insert_entry(hydra::JobsetInput {
-                    r#type: "string".to_string(),
-                    value: event.installation.id.to_string(),
-                });
             jobset
                 .inputs
                 .entry("repository_name".to_string())
