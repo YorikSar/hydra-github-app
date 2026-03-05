@@ -266,53 +266,38 @@ mod github {
             let (tx, mut rx) = mpsc::channel::<oneshot::Sender<String>>(32);
             let client_id = client_id.to_owned();
             tokio::spawn(async move {
-                let mut token_store: Option<String> = None;
+                let mut token_store: Option<(String, chrono::DateTime<_>)> = None;
                 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
                 let jwt_header =
                     URL_SAFE_NO_PAD.encode("{\"typ\":\"JWT\",\"alg\":\"RS256\"}") + ".";
                 let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key);
-                let expiration_timer = tokio::time::sleep(std::time::Duration::MAX);
-                tokio::pin!(expiration_timer);
-                // Instant::far_future is not public, so get it how we can
-                let far_future = expiration_timer.deadline();
-                loop {
-                    let new_token = tokio::select! {
-                        Some(chan) = rx.recv() => {
-                            let token = match token_store {
-                                Some(ref token) => token.clone(),
-                                None => {
-                                    let now = chrono::Utc::now();
-                                    let to_sign = jwt_header.clone() + URL_SAFE_NO_PAD.encode(
-                                        serde_json::json!({
-                                            "iat": (now - chrono::TimeDelta::seconds(60)).timestamp(),
-                                            "exp": (now + chrono::TimeDelta::minutes(10)).timestamp(),
-                                            "iss": client_id,
-                                        })
-                                        .to_string()
-                                        .as_str(),
-                                    )
-                                    .as_str();
-                                    use rsa::signature::{SignatureEncoding, Signer};
-                                    let signature = URL_SAFE_NO_PAD
-                                        .encode(signer.sign(to_sign.as_bytes()).to_bytes());
-                                    to_sign + "." + &signature
-                                }
-                            };
-                            chan.send(token.clone()).expect("failed to send a response over a channel");
-                            Some(token)
+                while let Some(chan) = rx.recv().await {
+                    let now = chrono::Utc::now();
+                    let token = match token_store {
+                        Some((ref token, ref expiration))
+                            if *expiration < now + chrono::TimeDelta::minutes(8) =>
+                        {
+                            token.clone()
                         }
-                        () = &mut expiration_timer => {
-                            eprintln!("application token is about to expire, invalidating");
-                            None
+                        _ => {
+                            let expiration = now + chrono::TimeDelta::minutes(10);
+                            let payload = serde_json::json!({
+                                "iat": (now - chrono::TimeDelta::seconds(60)).timestamp(),
+                                "exp": expiration.timestamp(),
+                                "iss": client_id,
+                            });
+                            let to_sign =
+                                jwt_header.clone() + &URL_SAFE_NO_PAD.encode(payload.to_string());
+                            use rsa::signature::{SignatureEncoding, Signer};
+                            let signature =
+                                URL_SAFE_NO_PAD.encode(signer.sign(to_sign.as_bytes()).to_bytes());
+                            let token = to_sign + "." + &signature;
+                            token_store = Some((token.clone(), expiration));
+                            token
                         }
                     };
-                    expiration_timer.as_mut().reset(match new_token {
-                        Some(ref _token) => {
-                            tokio::time::Instant::now() + std::time::Duration::from_mins(8)
-                        }
-                        None => far_future,
-                    });
-                    token_store = new_token;
+                    chan.send(token)
+                        .expect("failed to send a response over a channel");
                 }
             });
             ApplicationClient {
