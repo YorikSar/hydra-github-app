@@ -566,8 +566,8 @@ mod github {
     #[derive(Clone)]
     pub struct Client {
         http_client: reqwest::Client,
-        application_client: ApplicationClient,
         token_channel: mpsc::Sender<(u64, oneshot::Sender<Result<String>>)>,
+        repo_mapping_channel: mpsc::Sender<(String, oneshot::Sender<Result<u64>>)>,
     }
 
     impl Client {
@@ -581,16 +581,18 @@ mod github {
 
             let application_client = ApplicationClient::new(http_client.clone(), client_id, key);
 
-            let token_channel = {
-                let (tx, rx) = mpsc::channel::<(u64, oneshot::Sender<Result<String>>)>(32);
-                tokio::spawn(Self::token_manager(application_client.clone(), rx));
-                tx
-            };
-
             Client {
                 http_client,
-                application_client,
-                token_channel,
+                token_channel: {
+                    let (tx, rx) = mpsc::channel(32);
+                    tokio::spawn(Self::token_manager(application_client.clone(), rx));
+                    tx
+                },
+                repo_mapping_channel: {
+                    let (tx, rx) = mpsc::channel(32);
+                    tokio::spawn(Self::repo_mapping_manager(application_client.clone(), rx));
+                    tx
+                },
             }
         }
 
@@ -647,12 +649,42 @@ mod github {
             })
         }
 
+        async fn repo_mapping_manager(
+            application_client: ApplicationClient,
+            mut rx: mpsc::Receiver<(String, oneshot::Sender<Result<u64>>)>,
+        ) {
+            // TODO: expiration
+            let mut repo_map = std::collections::HashMap::<String, u64>::new();
+            while let Some((repo_full_name, chan)) = rx.recv().await {
+                use std::collections::hash_map::Entry;
+                chan.send(match repo_map.entry(repo_full_name.clone()) {
+                    Entry::Occupied(e) => Ok(*e.get()),
+                    Entry::Vacant(e) => {
+                        async {
+                            let installation_id = application_client
+                                .get_installation_for_repo(&repo_full_name)
+                                .await?;
+                            e.insert(installation_id);
+                            Ok(installation_id)
+                        }
+                        .await
+                    }
+                })
+                .expect("failed to send a response over a channel");
+            }
+        }
+
+        async fn get_installation_for_repo(&self, repo_full_name: &str) -> Result<u64> {
+            let (tx, rx) = oneshot::channel();
+            self.repo_mapping_channel
+                .send((repo_full_name.to_string(), tx))
+                .await
+                .expect("failed to send a request to a channel");
+            rx.await.expect("failed to receive response")
+        }
+
         pub async fn for_repo(&self, repo_full_name: &str) -> Result<InstallationClient> {
-            // TODO: cache responses
-            let installation_id = self
-                .application_client
-                .get_installation_for_repo(repo_full_name)
-                .await?;
+            let installation_id = self.get_installation_for_repo(repo_full_name).await?;
             self.for_installation(installation_id).await
         }
     }
