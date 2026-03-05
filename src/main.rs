@@ -581,7 +581,11 @@ mod github {
 
             let application_client = ApplicationClient::new(http_client.clone(), client_id, key);
 
-            let token_channel = Client::spawn_token_manager(application_client.clone());
+            let token_channel = {
+                let (tx, rx) = mpsc::channel::<(u64, oneshot::Sender<Result<String>>)>(32);
+                tokio::spawn(Self::token_manager(application_client.clone(), rx));
+                tx
+            };
 
             Client {
                 http_client,
@@ -590,46 +594,43 @@ mod github {
             }
         }
 
-        fn spawn_token_manager(
+        async fn token_manager(
             application_client: ApplicationClient,
-        ) -> mpsc::Sender<(u64, oneshot::Sender<Result<String>>)> {
-            let (tx, mut rx) = mpsc::channel::<(u64, oneshot::Sender<Result<String>>)>(32);
-            tokio::spawn(async move {
-                let mut installation_tokens = std::collections::HashMap::<u64, String>::new();
-                let mut expiration_queue = tokio_util::time::DelayQueue::new();
-                use futures_util::StreamExt;
-                loop {
-                    tokio::select! {
-                        Some((i, resp)) = rx.recv() => {
-                            use std::collections::hash_map::Entry;
-                            resp.send(match installation_tokens.entry(i) {
-                                Entry::Occupied(e) => Ok(e.get().clone()),
-                                Entry::Vacant(e) => async {
-                                    let (token, expires_at) = application_client
-                                        .get_installation_token(i)
-                                        .await?;
-                                    let diff = (expires_at - chrono::Utc::now())
-                                        .to_std()
-                                        .map_err(|_| anyhow!("new installation token for {i} expires in the past"))?;
-                                    expiration_queue.insert(i, diff);
-                                    e.insert(token.clone());
-                                    Ok(token)
-                                }.await
-                            })
-                            .expect("failed to send a response over a channel");
-                        }
-                        Some(expiration) = expiration_queue.next() => {
-                            let i = expiration.into_inner();
-                            eprintln!("installation token {i} is about to expire, invalidating");
-                            installation_tokens.remove(&i);
-                        }
+            mut rx: mpsc::Receiver<(u64, oneshot::Sender<Result<String>>)>,
+        ) -> ! {
+            let mut installation_tokens = std::collections::HashMap::<u64, String>::new();
+            let mut expiration_queue = tokio_util::time::DelayQueue::new();
+            use futures_util::StreamExt;
+            loop {
+                tokio::select! {
+                    Some((i, resp)) = rx.recv() => {
+                        use std::collections::hash_map::Entry;
+                        resp.send(match installation_tokens.entry(i) {
+                            Entry::Occupied(e) => Ok(e.get().clone()),
+                            Entry::Vacant(e) => async {
+                                let (token, expires_at) = application_client
+                                    .get_installation_token(i)
+                                    .await?;
+                                let diff = (expires_at - chrono::Utc::now())
+                                    .to_std()
+                                    .map_err(|_| anyhow!("new installation token for {i} expires in the past"))?;
+                                expiration_queue.insert(i, diff);
+                                e.insert(token.clone());
+                                Ok(token)
+                            }.await
+                        })
+                        .expect("failed to send a response over a channel");
+                    }
+                    Some(expiration) = expiration_queue.next() => {
+                        let i = expiration.into_inner();
+                        eprintln!("installation token {i} is about to expire, invalidating");
+                        installation_tokens.remove(&i);
                     }
                 }
-            });
-            tx
+            }
         }
 
-        pub async fn get_installation_token(&self, installation_id: u64) -> Result<String> {
+        async fn get_installation_token(&self, installation_id: u64) -> Result<String> {
             let (tx, rx) = oneshot::channel();
             self.token_channel
                 .send((installation_id, tx))
