@@ -1,20 +1,34 @@
 use anyhow::{Context, Result, anyhow};
 
 #[derive(serde::Deserialize, Debug)]
-struct Config {
-    pub listen: std::net::SocketAddr,
+struct GitHubAppConfig {
     pub webhook_secret_file: String,
     pub app_private_key_file: String,
-    pub user_agent: String,
-    pub allowed_repositories: Vec<String>,
     pub app_id: u64,
     pub client_id: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct HydraConfig {
+    pub url: String,
+    pub user: String,
+    pub password_env: String,
+    pub project: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct RepoConfig {
     pub check_run_name: String,
-    pub hydra_url: String,
-    pub hydra_user: String,
-    pub hydra_password_env: String,
-    pub hydra_project: String,
     pub hydra_jobset_template: hydra::Jobset,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct Config {
+    pub listen: std::net::SocketAddr,
+    pub user_agent: String,
+    pub github_app: GitHubAppConfig,
+    pub hydra: HydraConfig,
+    pub repositories: std::collections::HashMap<String, RepoConfig>,
 }
 
 fn load_config(filename: &std::path::Path) -> Result<Config> {
@@ -1160,15 +1174,15 @@ async fn sync_hydra_jobsets(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let _ = async {
             let project = hydra_client
-                .get_project(&config.hydra_project)
+                .get_project(&config.hydra.project)
                 .await
                 .with_context(|| {
                     format!(
                         "failed to get information about project {}",
-                        config.hydra_project
+                        config.hydra.project
                     )
                 })?;
-            //eprintln!("got project {}: {project:?}", config.hydra_project);
+            //eprintln!("got project {}: {project:?}", config.hydra.project);
             for jobset_name in project.jobsets {
                 let _ = async {
                     let (_pr_number, commit_sha) = match parse_jobset_name(&jobset_name) {
@@ -1176,7 +1190,7 @@ async fn sync_hydra_jobsets(
                         None => return Ok::<(), anyhow::Error>(()),
                     };
                     let jobset = hydra_client
-                        .get_jobset(&config.hydra_project, &jobset_name)
+                        .get_jobset(&config.hydra.project, &jobset_name)
                         .await?;
                     if matches!(jobset.enabled, hydra::JobsetEnabled::Disabled) || !jobset.visible {
                         return Ok(());
@@ -1189,6 +1203,15 @@ async fn sync_hydra_jobsets(
                         .ok_or_else(|| anyhow!("repository_name input not found"))?
                         .value;
 
+                    let repo_config = match config.repositories.get(repository_name) {
+                        Some(c) => c,
+                        None => {
+                            return Err(anyhow!(
+                                "repository not found in config: {repository_name}"
+                            ));
+                        }
+                    };
+
                     let installation_client = github_client.for_repo(repository_name).await?;
 
                     let data = 'data: {
@@ -1196,7 +1219,7 @@ async fn sync_hydra_jobsets(
                         use github::CheckRunStatus::*;
 
                         let details_url =
-                            hydra_client.jobset_url(&config.hydra_project, &jobset_name);
+                            hydra_client.jobset_url(&config.hydra.project, &jobset_name);
 
                         if jobset.errortime.is_some() {
                             eprintln!("jobset {jobset_name} failed to evaluate");
@@ -1213,7 +1236,7 @@ async fn sync_hydra_jobsets(
                             };
                         }
                         let evals = hydra_client
-                            .get_jobset_evals(&config.hydra_project, &jobset_name)
+                            .get_jobset_evals(&config.hydra.project, &jobset_name)
                             .await
                             .context("failed to get evals")?;
 
@@ -1265,8 +1288,8 @@ async fn sync_hydra_jobsets(
 
                     github::upsert_check(
                         installation_client,
-                        config.app_id,
-                        &config.check_run_name,
+                        config.github_app.app_id,
+                        &repo_config.check_run_name,
                         repository_name,
                         &commit_sha,
                         &data,
@@ -1277,7 +1300,7 @@ async fn sync_hydra_jobsets(
                         eprintln!("disabling jobset {jobset_name}");
                         hydra_client
                             .put_jobset(
-                                &config.hydra_project,
+                                &config.hydra.project,
                                 &jobset_name,
                                 hydra::Jobset {
                                     enabled: hydra::JobsetEnabled::Disabled,
@@ -1303,7 +1326,7 @@ async fn sync_hydra_jobsets(
 use github::{Installation, InstallationAction, InstallationRepositoriesAction, Payload};
 
 fn check_client_id(config: &Config, installation: &Installation) -> Result<(), warp::Rejection> {
-    if installation.client_id != config.client_id {
+    if installation.client_id != config.github_app.client_id {
         return Err(Error::Bad(format!(
             "Unexpected app client ID: {}",
             installation.client_id
@@ -1315,7 +1338,7 @@ fn check_client_id(config: &Config, installation: &Installation) -> Result<(), w
 
 fn warn_about_not_allowed_repositories<T: Iterator<Item = String>>(config: &Config, provided: T) {
     let notallowed: Vec<_> = provided
-        .filter(|r| !config.allowed_repositories.contains(r))
+        .filter(|r| !config.repositories.contains_key(r))
         .collect();
     if !notallowed.is_empty() {
         eprintln!(
@@ -1413,6 +1436,14 @@ async fn handle_payload(
             ) {
                 break 'pr;
             }
+            let repo_full_name = &event.repository.full_name;
+            let repo_config = match config.repositories.get(repo_full_name) {
+                Some(c) => c,
+                None => {
+                    eprintln!("repository not found in config: {repo_full_name}");
+                    break 'pr;
+                }
+            };
             let installation_client = github_client
                 .for_installation(event.installation.id)
                 .await
@@ -1420,7 +1451,7 @@ async fn handle_payload(
                 .map_err(Error::reject_internal)?;
             let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
                 &installation_client,
-                &event.repository.full_name,
+                repo_full_name,
                 event.pull_request.number,
                 &event.pull_request.head.sha,
             )
@@ -1431,7 +1462,7 @@ async fn handle_payload(
                 "pr-{}-{}",
                 event.pull_request.number, event.pull_request.head.sha
             );
-            let mut jobset = config.hydra_jobset_template.clone();
+            let mut jobset = repo_config.hydra_jobset_template.clone();
             // String::replace_first is only in nightly
             if let Some((start, match_str)) = jobset.description.match_indices("{pr_url}").next() {
                 jobset
@@ -1456,7 +1487,7 @@ async fn handle_payload(
                 .entry("repository_name".to_string())
                 .insert_entry(hydra::JobsetInput {
                     r#type: "string".to_string(),
-                    value: event.repository.full_name.clone(),
+                    value: repo_full_name.clone(),
                 });
             jobset
                 .inputs
@@ -1466,11 +1497,11 @@ async fn handle_payload(
                     value: event.pull_request.number.to_string(),
                 });
             let res = hydra_client
-                .put_jobset(&config.hydra_project, &jobset_id, jobset)
+                .put_jobset(&config.hydra.project, &jobset_id, jobset)
                 .await
                 .inspect_err(|err| eprintln!("{err}"));
             if res.is_ok() {
-                let project_jobset = format!("{}:{}", config.hydra_project, jobset_id);
+                let project_jobset = format!("{}:{}", config.hydra.project, jobset_id);
                 if let Ok(jobsets_triggered) = hydra_client
                     .trigger_jobset(&project_jobset)
                     .await
@@ -1482,15 +1513,15 @@ async fn handle_payload(
                         eprintln!("jobset {project_jobset} was triggered successfully");
                         let _ = github::upsert_check(
                             installation_client,
-                            config.app_id,
-                            &config.check_run_name,
-                            &event.repository.full_name,
+                            config.github_app.app_id,
+                            &repo_config.check_run_name,
+                            repo_full_name,
                             &event.pull_request.head.sha,
                             &github::UpsertCheckRunData {
                                 status: github::CheckRunStatus::Queued,
                                 details_url: format!(
                                     "{}/jobset/{}/{}",
-                                    config.hydra_url, config.hydra_project, jobset_id
+                                    config.hydra.url, config.hydra.project, jobset_id
                                 ),
                             },
                         )
@@ -1549,30 +1580,29 @@ async fn main() -> Result<()> {
     })?;
     let cfg = std::sync::Arc::new(load_config(arg.as_ref())?);
     let listen_address = cfg.listen;
-    let webhook_secret = std::fs::read_to_string(&cfg.webhook_secret_file)
+    let webhook_secret = std::fs::read_to_string(&cfg.github_app.webhook_secret_file)
         .context("Unable to read webhook secret file")?;
     let webhook_secret = webhook_secret.trim().to_string();
 
     let hydra_client = hydra::Client::new(
-        &cfg.hydra_url,
+        &cfg.hydra.url,
         &cfg.user_agent,
-        &cfg.hydra_user,
-        std::env::var(&cfg.hydra_password_env).context("couldn't read Hydra env var")?,
+        &cfg.hydra.user,
+        std::env::var(&cfg.hydra.password_env).context("couldn't read Hydra env var")?,
     )
     .await?;
 
     use rsa::pkcs1::DecodeRsaPrivateKey;
     let github_client = github::Client::new(
         &cfg.user_agent,
-        &cfg.client_id,
-        rsa::RsaPrivateKey::read_pkcs1_pem_file(cfg.app_private_key_file.as_str()).with_context(
-            || {
+        &cfg.github_app.client_id,
+        rsa::RsaPrivateKey::read_pkcs1_pem_file(cfg.github_app.app_private_key_file.as_str())
+            .with_context(|| {
                 format!(
                     "couldn't read private key from {}",
-                    cfg.app_private_key_file
+                    cfg.github_app.app_private_key_file
                 )
-            },
-        )?,
+            })?,
     );
 
     tokio::spawn(sync_hydra_jobsets(
