@@ -1640,10 +1640,13 @@ async fn main() -> Result<()> {
                             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                         ))
                     }
-                    Error::Bad(s) => Ok(warp::reply::with_status(
-                        s.clone(),
-                        warp::http::StatusCode::BAD_REQUEST,
-                    )),
+                    Error::Bad(s) => {
+                        eprintln!("bad request: {}", s);
+                        Ok(warp::reply::with_status(
+                            s.clone(),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ))
+                    }
                 }
             } else {
                 Err(err)
