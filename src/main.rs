@@ -285,18 +285,25 @@ mod github {
                 let jwt_header =
                     URL_SAFE_NO_PAD.encode("{\"typ\":\"JWT\",\"alg\":\"RS256\"}") + ".";
                 let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key);
+                const TOKEN_VALIDITY_BEFORE: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+                const TOKEN_VALIDITY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+                const TOKEN_REISSUE_MARGIN: chrono::TimeDelta = TOKEN_VALIDITY
+                    .checked_div(5)
+                    .unwrap()
+                    .checked_mul(4)
+                    .unwrap();
                 while let Some(chan) = rx.recv().await {
                     let now = chrono::Utc::now();
                     let token = match token_store {
                         Some((ref token, ref expiration))
-                            if *expiration < now + chrono::TimeDelta::minutes(8) =>
+                            if *expiration > now + TOKEN_REISSUE_MARGIN =>
                         {
                             token.clone()
                         }
                         _ => {
-                            let expiration = now + chrono::TimeDelta::minutes(10);
+                            let expiration = now + TOKEN_VALIDITY;
                             let payload = serde_json::json!({
-                                "iat": (now - chrono::TimeDelta::seconds(60)).timestamp(),
+                                "iat": (now - TOKEN_VALIDITY_BEFORE).timestamp(),
                                 "exp": expiration.timestamp(),
                                 "iss": client_id,
                             });
