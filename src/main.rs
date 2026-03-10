@@ -724,34 +724,42 @@ mod github {
         sha: &str,
         data: &UpsertCheckRunData,
     ) -> Result<()> {
+        // TODO: do multiple checks at once to avoid looping for each one
         let check_runs = installation_client
             .get_check_runs_for_commit(repo, app_id, sha)
             .await?;
         //eprintln!("got check runs: {check_runs:?}");
-        match check_runs
-            .into_iter()
-            .find(|cr| cr.app.as_ref().is_some_and(|app| app.id == app_id))
-        {
+        match check_runs.into_iter().find(|cr| {
+            cr.app.as_ref().is_some_and(|app| app.id == app_id) && cr.name == check_run_name
+        }) {
             Some(check_run) => {
-                eprintln!("found check run for sha {sha} with id {}", check_run.id);
-                if check_run.name == check_run_name
-                    && check_run.status == data.status
-                    && check_run.details_url == data.details_url
-                {
-                    eprintln!("check run for sha {sha} is already in the expected state");
+                eprintln!(
+                    "found check run \"{check_run_name}\" for commit {sha} with id {}",
+                    check_run.id
+                );
+                if check_run.status == data.status && check_run.details_url == data.details_url {
+                    eprintln!(
+                        "check run \"{check_run_name}\" for commit {sha} is already in the expected state"
+                    );
                     return Ok(());
                 }
                 installation_client
                     .patch_check_run(repo, check_run.id, check_run_name, sha, data)
                     .await?;
-                eprintln!("check run for commit {sha} has been updated successfully");
+                eprintln!(
+                    "check run \"{check_run_name}\" for commit {sha} has been updated successfully"
+                );
             }
             None => {
-                eprintln!("check run for sha {sha} not found, will create a new one");
+                eprintln!(
+                    "check run \"{check_run_name}\" for commit {sha} not found, will create a new one"
+                );
                 installation_client
                     .post_check_run(repo, check_run_name, sha, data)
                     .await?;
-                eprintln!("check run for commit {sha} has been created successfully");
+                eprintln!(
+                    "check run \"{check_run_name}\" for commit {sha} has been created successfully"
+                );
             }
         };
         Ok(())
