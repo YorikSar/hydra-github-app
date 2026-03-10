@@ -892,6 +892,84 @@ mod hydra {
         false
     }
 
+    #[derive(serde_repr::Serialize_repr, serde_repr::Deserialize_repr)]
+    #[repr(u8)]
+    enum JobsetDefinitionType {
+        Legacy = 0,
+        Flake = 1,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    #[serde(default)]
+    struct JobsetDefinitionFields {
+        r#type: Option<JobsetDefinitionType>,
+        nixexprinput: String,
+        nixexprpath: String,
+        inputs: std::collections::HashMap<String, JobsetInput>,
+        flake: String,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+    #[serde(try_from = "JobsetDefinitionFields")]
+    #[serde(into = "JobsetDefinitionFields")]
+    pub enum JobsetDefinition {
+        Legacy {
+            nixexprinput: String,
+            nixexprpath: String,
+            inputs: std::collections::HashMap<String, JobsetInput>,
+        },
+        Flake {
+            flake: String,
+        },
+    }
+
+    impl TryFrom<JobsetDefinitionFields> for JobsetDefinition {
+        type Error = anyhow::Error;
+
+        fn try_from(value: JobsetDefinitionFields) -> Result<Self> {
+            let r#type = value.r#type.unwrap_or_else(|| {
+                if value.nixexprinput.is_empty() {
+                    JobsetDefinitionType::Flake
+                } else {
+                    JobsetDefinitionType::Legacy
+                }
+            });
+            Ok(match r#type {
+                JobsetDefinitionType::Legacy => JobsetDefinition::Legacy {
+                    nixexprinput: value.nixexprinput,
+                    nixexprpath: value.nixexprpath,
+                    inputs: value.inputs,
+                },
+                JobsetDefinitionType::Flake => JobsetDefinition::Flake { flake: value.flake },
+            })
+        }
+    }
+
+    impl Into<JobsetDefinitionFields> for JobsetDefinition {
+        fn into(self) -> JobsetDefinitionFields {
+            match self {
+                JobsetDefinition::Legacy {
+                    nixexprinput,
+                    nixexprpath,
+                    inputs,
+                } => JobsetDefinitionFields {
+                    r#type: Some(JobsetDefinitionType::Legacy),
+                    nixexprinput,
+                    nixexprpath,
+                    inputs,
+                    flake: Default::default(),
+                },
+                JobsetDefinition::Flake { flake } => JobsetDefinitionFields {
+                    r#type: Some(JobsetDefinitionType::Flake),
+                    nixexprinput: Default::default(),
+                    nixexprpath: Default::default(),
+                    inputs: Default::default(),
+                    flake,
+                },
+            }
+        }
+    }
+
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
     pub struct Jobset {
         #[serde(default)]
@@ -899,12 +977,11 @@ mod hydra {
         #[serde(default = "return_false")]
         pub visible: bool,
         pub description: String,
-        pub nixexprinput: String,
-        pub nixexprpath: String,
+        #[serde(flatten)]
+        pub definition: JobsetDefinition,
         pub triggertime: Option<u64>,
         pub starttime: Option<u64>,
         pub errortime: Option<u64>,
-        pub inputs: std::collections::HashMap<String, JobsetInput>,
     }
 
     #[derive(serde::Deserialize)]
@@ -1220,11 +1297,32 @@ async fn sync_hydra_jobsets(
                     }
                     eprintln!("got jobset: {jobset_name}");
 
-                    let repository_name = &jobset
-                        .inputs
-                        .get("repository_name")
-                        .ok_or_else(|| anyhow!("repository_name input not found"))?
-                        .value;
+                    let repository_name = match jobset.definition {
+                        hydra::JobsetDefinition::Legacy { ref inputs, .. } => {
+                            &inputs
+                                .get("repository_name")
+                                .ok_or_else(|| anyhow!("repository_name input not found"))?
+                                .value
+                        }
+                        hydra::JobsetDefinition::Flake { ref flake } => {
+                            // flake jobsets don't have inputs, so we have to parse repo name from the flake URI
+                            let mut schema_split = flake.split(':');
+                            if !schema_split.next().is_some_and(|s| s == "github") {
+                                return Err(anyhow!("unexpected schema in flake URI {flake}"));
+                            }
+                            let path = schema_split.next().ok_or_else(|| {
+                                anyhow!("failed to get flake path from URI {flake}")
+                            })?;
+                            let mut path_split = path.split('/');
+                            let org = path_split.next().ok_or_else(|| {
+                                anyhow!("failed to get GitHub org from flake URL {flake}")
+                            })?;
+                            let repo = path_split.next().ok_or_else(|| {
+                                anyhow!("failed to get GitHub repo from flake URL {flake}")
+                            })?;
+                            &format!("{org}/{repo}")
+                        }
+                    };
 
                     let repo_config = match config.repositories.get(repository_name) {
                         Some(c) => c,
@@ -1516,40 +1614,52 @@ async fn handle_payload(
                     .description
                     .replace_range(start..start + match_str.len(), &event.pull_request.html_url);
             }
-            for input in jobset.inputs.values_mut() {
-                match input.r#type.as_str() {
-                    "pr merge" => {
-                        input.r#type = "git".to_string();
-                        input.value = format!("{} {merge_commit_sha}", event.repository.clone_url);
+            match jobset.definition {
+                hydra::JobsetDefinition::Legacy { ref mut inputs, .. } => {
+                    for input in inputs.values_mut() {
+                        match input.r#type.as_str() {
+                            "pr merge" => {
+                                input.r#type = "git".to_string();
+                                input.value =
+                                    format!("{} {merge_commit_sha}", event.repository.clone_url);
+                            }
+                            "pr base" => {
+                                input.r#type = "git".to_string();
+                                input.value =
+                                    format!("{} {target_commit_sha}", event.repository.clone_url);
+                            }
+                            "pr head" => {
+                                input.r#type = "git".to_string();
+                                input.value = format!(
+                                    "{} {}",
+                                    event.repository.clone_url, event.pull_request.head.sha
+                                );
+                            }
+                            _ => {}
+                        };
                     }
-                    "pr base" => {
-                        input.r#type = "git".to_string();
-                        input.value = format!("{} {target_commit_sha}", event.repository.clone_url);
-                    }
-                    "pr head" => {
-                        input.r#type = "git".to_string();
-                        input.value = format!(
-                            "{} {}",
-                            event.repository.clone_url, event.pull_request.head.sha
-                        );
+                    inputs
+                        .entry("repository_name".to_string())
+                        .insert_entry(hydra::JobsetInput {
+                            r#type: "string".to_string(),
+                            value: repo_full_name.clone(),
+                        });
+                    inputs
+                        .entry("pr_number".to_string())
+                        .insert_entry(hydra::JobsetInput {
+                            r#type: "string".to_string(),
+                            value: event.pull_request.number.to_string(),
+                        });
+                }
+                hydra::JobsetDefinition::Flake { ref mut flake } => match flake.as_str() {
+                    "{pr merge}" => *flake = format!("github:{repo_full_name}/{merge_commit_sha}"),
+                    "{pr base}" => *flake = format!("github:{repo_full_name}/{target_commit_sha}"),
+                    "{pr head}" => {
+                        *flake = format!("github:{repo_full_name}/{}", event.pull_request.head.sha)
                     }
                     _ => {}
-                };
+                },
             }
-            jobset
-                .inputs
-                .entry("repository_name".to_string())
-                .insert_entry(hydra::JobsetInput {
-                    r#type: "string".to_string(),
-                    value: repo_full_name.clone(),
-                });
-            jobset
-                .inputs
-                .entry("pr_number".to_string())
-                .insert_entry(hydra::JobsetInput {
-                    r#type: "string".to_string(),
-                    value: event.pull_request.number.to_string(),
-                });
             let res = hydra_client
                 .put_jobset(&config.hydra.project, &jobset_id, jobset)
                 .await
