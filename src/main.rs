@@ -982,6 +982,7 @@ mod hydra {
         pub triggertime: Option<u64>,
         pub starttime: Option<u64>,
         pub errortime: Option<u64>,
+        pub errormsg: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -1167,7 +1168,8 @@ mod hydra {
 
         pub async fn get_jobset(&self, project: &str, jobset: &str) -> Result<Jobset> {
             self.http_client
-                .get(self.jobset_url(project, jobset))
+                // Use undocumented /jobset/<project>/<jobset>/errors API that actually returns errormsg
+                .get(self.jobset_url(project, jobset) + "/errors")
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await
@@ -1342,7 +1344,9 @@ async fn sync_hydra_jobsets(
                         let details_url =
                             hydra_client.jobset_url(&config.hydra.project, &jobset_name);
 
-                        if jobset.errortime.is_some() {
+                        if jobset.errortime.is_some()
+                            && jobset.errormsg.as_ref().is_some_and(|m| !m.is_empty())
+                        {
                             eprintln!("jobset {jobset_name} failed to evaluate");
                             break 'data (Completed(Failure), details_url, None);
                         }
