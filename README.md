@@ -72,7 +72,8 @@ Configuration file is a JSON with following fields:
     * `user` and `password_env` are user name and the name of the environment variable containing the password that will be used to authenticate in Hydra.
     * `project` is the name of the project in Hydra where jobsets will be created and watched.
 * `repositories` is an object with full names (`"ORG/REPO"`) of the GitHub repositories that are allowed to trigger Hydra builds as keys and following properties:
-    * `check_run_name` is the name of the check that will be created on each commit.
+    * `check_run_name` is the name of the check representing the whole jobset that will be created on each commit.
+    * `check_per_job` is a boolean flag, if it is enabled, every job in the jobset will be represented as a separate check named after its attribute path.
     * `hydra_jobset_template` is a representation of Hydra jobset configuration with following allowances:
         * `description` field can contain `{pr_url}` string that will be replaced with the URL of the PR that triggered this jobset;
         * `inputs` can contain inputs with no values with special types:
