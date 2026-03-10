@@ -1526,6 +1526,13 @@ async fn handle_payload(
                         input.r#type = "git".to_string();
                         input.value = format!("{} {target_commit_sha}", event.repository.clone_url);
                     }
+                    "pr head" => {
+                        input.r#type = "git".to_string();
+                        input.value = format!(
+                            "{} {}",
+                            event.repository.clone_url, event.pull_request.head.sha
+                        );
+                    }
                     _ => {}
                 };
             }
