@@ -717,7 +717,7 @@ mod github {
     }
 
     pub async fn upsert_check(
-        installation_client: InstallationClient,
+        installation_client: &InstallationClient,
         app_id: u64,
         check_run_name: &str,
         repo: &str,
@@ -1302,7 +1302,7 @@ async fn sync_hydra_jobsets(
                     };
 
                     github::upsert_check(
-                        installation_client,
+                        &installation_client,
                         config.github_app.app_id,
                         &repo_config.check_run_name,
                         repository_name,
@@ -1527,7 +1527,7 @@ async fn handle_payload(
                     } else {
                         eprintln!("jobset {project_jobset} was triggered successfully");
                         let _ = github::upsert_check(
-                            installation_client,
+                            &installation_client,
                             config.github_app.app_id,
                             &repo_config.check_run_name,
                             repo_full_name,
