@@ -267,18 +267,22 @@ mod github {
 
     use tokio::sync::{mpsc, oneshot};
 
+    /// A lower-level client to manage GitHub application specifics like:
+    /// - managing application tokens
+    /// - getting installation tokens
+    /// - getting installation ID for repo
     #[derive(Clone)]
-    pub struct ApplicationClient {
+    pub struct LowerApplicationClient {
         http_client: reqwest::Client,
         token_channel: mpsc::Sender<oneshot::Sender<String>>,
     }
 
-    impl ApplicationClient {
+    impl LowerApplicationClient {
         fn new(
             http_client: reqwest::Client,
             client_id: &str,
             key: rsa::RsaPrivateKey,
-        ) -> ApplicationClient {
+        ) -> LowerApplicationClient {
             let (tx, mut rx) = mpsc::channel::<oneshot::Sender<String>>(32);
             let client_id = client_id.to_owned();
             tokio::spawn(async move {
@@ -323,7 +327,7 @@ mod github {
                         .expect("failed to send a response over a channel");
                 }
             });
-            ApplicationClient {
+            LowerApplicationClient {
                 http_client,
                 token_channel: tx,
             }
@@ -397,6 +401,57 @@ mod github {
         }
     }
 
+    /// This client contains methods for all actions that can be done with most GitHub tokens
+    #[derive(Clone)]
+    pub struct Client {
+        http_client: reqwest::Client,
+        token: String,
+    }
+
+    impl Client {
+        pub async fn get_pull_request(
+            &self,
+            repo_full_name: &str,
+            pr_number: u64,
+        ) -> Result<PullRequest> {
+            self.http_client
+                .get(format!(
+                    "https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
+                ))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .with_context(|| format!("failed to send request for pull request {pr_number}"))?
+                .error_for_status()
+                .with_context(|| format!("request for pull request {pr_number} failed"))?
+                .json::<PullRequest>()
+                .await
+                .context("couldn't parse JSON response")
+        }
+
+        pub async fn get_commit(
+            &self,
+            repo_full_name: &str,
+            commit_sha: &str,
+        ) -> Result<GitCommit> {
+            self.http_client
+                .get(format!(
+                    "https://api.github.com/repos/{repo_full_name}/git/commits/{commit_sha}"
+                ))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .with_context(|| format!("failed to send request for commit {commit_sha}"))?
+                .error_for_status()
+                .with_context(|| format!("request for commit {commit_sha} failed"))?
+                .json::<GitCommit>()
+                .await
+                .context("couldn't parse JSON response")
+        }
+    }
+
+    /// This client covers actions that can only be done via a GitHub App installation.
+    /// It can be created via `ApplicationClient::for_installation`
     #[derive(Clone)]
     pub struct InstallationClient {
         http_client: reqwest::Client,
@@ -406,6 +461,13 @@ mod github {
     }
 
     impl InstallationClient {
+        pub fn get_client(&self) -> Client {
+            Client {
+                http_client: self.http_client.clone(),
+                token: self.token.clone(),
+            }
+        }
+
         pub async fn patch_check_suites_preferences(
             &self,
             repo_full_name: String,
@@ -544,57 +606,21 @@ mod github {
                 })?;
             Ok(())
         }
-
-        pub async fn get_pull_request(
-            &self,
-            repo_full_name: &str,
-            pr_number: u64,
-        ) -> Result<PullRequest> {
-            self.http_client
-                .get(format!(
-                    "https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
-                ))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .with_context(|| format!("failed to send request for pull request {pr_number}"))?
-                .error_for_status()
-                .with_context(|| format!("request for pull request {pr_number} failed"))?
-                .json::<PullRequest>()
-                .await
-                .context("couldn't parse JSON response")
-        }
-
-        pub async fn get_commit(
-            &self,
-            repo_full_name: &str,
-            commit_sha: &str,
-        ) -> Result<GitCommit> {
-            self.http_client
-                .get(format!(
-                    "https://api.github.com/repos/{repo_full_name}/git/commits/{commit_sha}"
-                ))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .with_context(|| format!("failed to send request for commit {commit_sha}"))?
-                .error_for_status()
-                .with_context(|| format!("request for commit {commit_sha} failed"))?
-                .json::<GitCommit>()
-                .await
-                .context("couldn't parse JSON response")
-        }
     }
 
     #[derive(Clone)]
-    pub struct Client {
+    pub struct ApplicationClient {
         http_client: reqwest::Client,
         token_channel: mpsc::Sender<(u64, oneshot::Sender<Result<String>>)>,
         repo_mapping_channel: mpsc::Sender<(String, oneshot::Sender<Result<u64>>)>,
     }
 
-    impl Client {
-        pub fn new(user_agent: &str, client_id: &str, key: rsa::RsaPrivateKey) -> Client {
+    impl ApplicationClient {
+        pub fn new(
+            user_agent: &str,
+            client_id: &str,
+            key: rsa::RsaPrivateKey,
+        ) -> ApplicationClient {
             // TODO: wrap in a tower service with a buffer and rate limits to keep GitHub happy
             let http_client = reqwest::ClientBuilder::new()
                 //.connection_verbose(true)
@@ -602,13 +628,17 @@ mod github {
                 .build()
                 .expect("couldn't build client");
 
-            let application_client = ApplicationClient::new(http_client.clone(), client_id, key);
+            let application_client =
+                LowerApplicationClient::new(http_client.clone(), client_id, key);
 
-            Client {
+            ApplicationClient {
                 http_client,
                 token_channel: {
                     let (tx, rx) = mpsc::channel(32);
-                    tokio::spawn(Self::token_manager(application_client.clone(), rx));
+                    tokio::spawn(Self::installation_token_manager(
+                        application_client.clone(),
+                        rx,
+                    ));
                     tx
                 },
                 repo_mapping_channel: {
@@ -619,8 +649,8 @@ mod github {
             }
         }
 
-        async fn token_manager(
-            application_client: ApplicationClient,
+        async fn installation_token_manager(
+            application_client: LowerApplicationClient,
             mut rx: mpsc::Receiver<(u64, oneshot::Sender<Result<String>>)>,
         ) -> ! {
             let mut installation_tokens = std::collections::HashMap::<u64, String>::new();
@@ -673,7 +703,7 @@ mod github {
         }
 
         async fn repo_mapping_manager(
-            application_client: ApplicationClient,
+            application_client: LowerApplicationClient,
             mut rx: mpsc::Receiver<(String, oneshot::Sender<Result<u64>>)>,
         ) {
             // TODO: expiration
@@ -770,7 +800,7 @@ mod github {
     // See https://docs.github.com/en/rest/guides/using-the-rest-api-to-interact-with-your-git-database?apiVersion=2022-11-28#checking-mergeability-of-pull-requests
     // for details. We have to request PR data for the merge process to start, then poll it until it's ready.
     pub async fn ensure_pr_merge_commit(
-        installation_client: &InstallationClient,
+        github_client: &Client,
         repo: &str,
         pr_number: u64,
         pr_head_sha: &str,
@@ -783,9 +813,7 @@ mod github {
             if timeout > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
             }
-            let pr = installation_client
-                .get_pull_request(repo, pr_number)
-                .await?;
+            let pr = github_client.get_pull_request(repo, pr_number).await?;
             //eprintln!("got PR: {:#?}", pr);
             if pr.head.sha != *pr_head_sha {
                 return Err(anyhow!(
@@ -804,9 +832,7 @@ mod github {
             let Some(merge_commit_sha) = pr.merge_commit_sha else {
                 continue;
             };
-            let merge_commit = installation_client
-                .get_commit(repo, &merge_commit_sha)
-                .await?;
+            let merge_commit = github_client.get_commit(repo, &merge_commit_sha).await?;
             let Ok([target, head]): Result<[_; 2], _> = merge_commit.parents.try_into() else {
                 eprintln!("number of parents for merge commit for PR {pr_number} is not 2");
                 continue;
@@ -1269,7 +1295,7 @@ fn test_parse_jobset_name() {
 async fn sync_hydra_jobsets(
     config: std::sync::Arc<Config>,
     hydra_client: hydra::Client,
-    github_client: github::Client,
+    github_client: github::ApplicationClient,
 ) {
     // TODO: keep a task per jobset in memory instead of looping
     loop {
@@ -1509,7 +1535,7 @@ pub struct JobsetsTriggeredResponse {
 
 async fn handle_payload(
     hydra_client: hydra::Client,
-    github_client: github::Client,
+    github_client: github::ApplicationClient,
     config: std::sync::Arc<Config>,
     payload: Payload,
 ) -> Result<impl warp::Reply, warp::Rejection> {
@@ -1599,7 +1625,7 @@ async fn handle_payload(
                 .context("couldn't get installation client")
                 .map_err(Error::reject_internal)?;
             let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
-                &installation_client,
+                &installation_client.get_client(),
                 repo_full_name,
                 event.pull_request.number,
                 &event.pull_request.head.sha,
@@ -1761,7 +1787,7 @@ async fn main() -> Result<()> {
     .await?;
 
     use rsa::pkcs1::DecodeRsaPrivateKey;
-    let github_client = github::Client::new(
+    let github_client = github::ApplicationClient::new(
         &cfg.user_agent,
         &cfg.github_app.client_id,
         rsa::RsaPrivateKey::read_pkcs1_pem_file(cfg.github_app.app_private_key_file.as_str())
