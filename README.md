@@ -124,6 +124,14 @@ Configuration file is a JSON with following fields:
                     }
                 }
             }
+        },
+        "NixOS/nix": {
+            "check_run_name": "Hydra eval",
+            "check_per_job": true,
+            "hydra_jobset_template": {
+                "description": "triggered by PR {pr_url}",
+                "flake": "{pr head}"
+            }
         }
     }
 }
