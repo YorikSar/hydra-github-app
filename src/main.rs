@@ -927,7 +927,7 @@ mod hydra {
         type Error = anyhow::Error;
 
         fn try_from(value: JobsetDefinitionFields) -> Result<Self> {
-            let r#type = value.r#type.unwrap_or_else(|| {
+            let r#type = value.r#type.unwrap_or({
                 if value.nixexprinput.is_empty() {
                     JobsetDefinitionType::Flake
                 } else {
@@ -945,9 +945,9 @@ mod hydra {
         }
     }
 
-    impl Into<JobsetDefinitionFields> for JobsetDefinition {
-        fn into(self) -> JobsetDefinitionFields {
-            match self {
+    impl From<JobsetDefinition> for JobsetDefinitionFields {
+        fn from(val: JobsetDefinition) -> Self {
+            match val {
                 JobsetDefinition::Legacy {
                     nixexprinput,
                     nixexprpath,
@@ -1309,7 +1309,7 @@ async fn sync_hydra_jobsets(
                         hydra::JobsetDefinition::Flake { ref flake } => {
                             // flake jobsets don't have inputs, so we have to parse repo name from the flake URI
                             let mut schema_split = flake.split(':');
-                            if !schema_split.next().is_some_and(|s| s == "github") {
+                            if schema_split.next().is_none_or(|s| s != "github") {
                                 return Err(anyhow!("unexpected schema in flake URI {flake}"));
                             }
                             let path = schema_split.next().ok_or_else(|| {
