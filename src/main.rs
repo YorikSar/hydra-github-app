@@ -41,24 +41,36 @@ fn load_config(filename: &std::path::Path) -> Result<Config> {
     Ok(deserialized)
 }
 
-#[derive(Debug)]
-enum Error {
-    Internal(anyhow::Error),
-    Bad(String),
-}
-
-impl warp::reject::Reject for Error {}
-
-impl Error {
-    fn reject_internal(err: anyhow::Error) -> warp::Rejection {
-        warp::reject::custom(Error::Internal(err))
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    let mut args = std::env::args_os();
+    let program_name = args
+        .next()
+        .map(|os_str| os_str.to_string_lossy().to_string())
+        .unwrap_or("<hydra-github-app>".to_string());
+    let usage = || anyhow!("usage: {program_name} <config> [webhook]");
+    let config_file_name = args.next().ok_or_else(usage)?;
+    let action = args.next().map_or_else(
+        || "webhook".to_string(),
+        |s| s.to_string_lossy().to_string(),
+    );
+    if args.next().is_some() {
+        return Err(usage());
     }
-}
 
-// Signature verification
+    let cfg = load_config(config_file_name.as_ref())?;
+    let run_fn = match action.as_ref() {
+        "webhook" => webhook::run,
+        _ => return Err(usage()),
+    };
+    run_fn(cfg).await
+}
 
 mod github {
     use anyhow::{Context, Result, anyhow};
+
+    // Signature verification
 
     pub async fn check_signature(
         secret: String,
@@ -849,50 +861,6 @@ mod github {
     }
 }
 
-fn check_signature_filter(
-    secret: String,
-) -> impl warp::Filter<Extract = (bytes::Bytes,), Error = warp::Rejection> + Clone + Send + Sync + 'static
-{
-    use futures_util::TryFutureExt;
-    let secret = std::sync::Arc::new(secret);
-    use warp::Filter;
-    warp::header::<String>("X-Hub-Signature-256")
-        .and_then(async |header| {
-            github::parse_signature_header(header)
-                .await
-                .map_err(Error::reject_internal)
-        })
-        .and(warp::body::content_length_limit(1024 * 1024))
-        .and(warp::body::bytes())
-        .and_then(move |sig, body| {
-            github::check_signature(secret.clone().to_string(), sig, body)
-                .map_err(Error::reject_internal)
-        })
-}
-
-#[tokio::test]
-async fn test_signature_verification() {
-    use warp::Filter;
-    let filter = warp::post()
-        .and(check_signature_filter(
-            "It's a Secret to Everybody".to_owned(),
-        ))
-        .map(|_| warp::reply());
-
-    let response = warp::test::request()
-        .method("POST")
-        .path("/")
-        .header(
-            "X-Hub-Signature-256",
-            "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17",
-        )
-        .body("Hello, World!")
-        .reply(&filter)
-        .await;
-    eprintln!("{:?}", response);
-    assert_eq!(response.status(), 200);
-}
-
 mod hydra {
     use anyhow::{Context, Result};
 
@@ -1292,28 +1260,97 @@ fn test_parse_jobset_name() {
     );
 }
 
-async fn sync_hydra_jobsets(
-    config: std::sync::Arc<Config>,
-    hydra_client: hydra::Client,
-    github_client: github::ApplicationClient,
-) {
-    // TODO: keep a task per jobset in memory instead of looping
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let _ = async {
-            let project = hydra_client
-                .get_project(&config.hydra.project)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to get information about project {}",
-                        config.hydra.project
-                    )
-                })?;
-            //eprintln!("got project {}: {project:?}", config.hydra.project);
-            for jobset_name in project.jobsets {
-                let _ = async {
-                    let (_pr_number, commit_sha) = match parse_jobset_name(&jobset_name) {
+mod webhook {
+    use crate::github::{
+        Installation, InstallationAction, InstallationRepositoriesAction, Payload,
+    };
+    use crate::{Config, github, hydra};
+    use anyhow::{Context, Result, anyhow};
+
+    #[derive(Debug)]
+    enum Error {
+        Internal(anyhow::Error),
+        Bad(String),
+    }
+
+    impl warp::reject::Reject for Error {}
+
+    impl Error {
+        fn reject_internal(err: anyhow::Error) -> warp::Rejection {
+            warp::reject::custom(Error::Internal(err))
+        }
+    }
+
+    fn check_signature_filter(
+        secret: String,
+    ) -> impl warp::Filter<Extract = (bytes::Bytes,), Error = warp::Rejection>
+    + Clone
+    + Send
+    + Sync
+    + 'static {
+        use futures_util::TryFutureExt;
+        let secret = std::sync::Arc::new(secret);
+        use warp::Filter;
+        warp::header::<String>("X-Hub-Signature-256")
+            .and_then(async |header| {
+                github::parse_signature_header(header)
+                    .await
+                    .map_err(Error::reject_internal)
+            })
+            .and(warp::body::content_length_limit(1024 * 1024))
+            .and(warp::body::bytes())
+            .and_then(move |sig, body| {
+                github::check_signature(secret.clone().to_string(), sig, body)
+                    .map_err(Error::reject_internal)
+            })
+    }
+
+    #[tokio::test]
+    async fn test_signature_verification() {
+        use warp::Filter;
+        let filter = warp::post()
+            .and(check_signature_filter(
+                "It's a Secret to Everybody".to_owned(),
+            ))
+            .map(|_| warp::reply());
+
+        let response = warp::test::request()
+            .method("POST")
+            .path("/")
+            .header(
+                "X-Hub-Signature-256",
+                "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17",
+            )
+            .body("Hello, World!")
+            .reply(&filter)
+            .await;
+        eprintln!("{:?}", response);
+        assert_eq!(response.status(), 200);
+    }
+
+    async fn sync_hydra_jobsets(
+        config: std::sync::Arc<Config>,
+        hydra_client: hydra::Client,
+        github_client: github::ApplicationClient,
+    ) {
+        // TODO: keep a task per jobset in memory instead of looping
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ =
+                async {
+                    let project = hydra_client
+                        .get_project(&config.hydra.project)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to get information about project {}",
+                                config.hydra.project
+                            )
+                        })?;
+                    //eprintln!("got project {}: {project:?}", config.hydra.project);
+                    for jobset_name in project.jobsets {
+                        let _ = async {
+                    let (_pr_number, commit_sha) = match crate::parse_jobset_name(&jobset_name) {
                         Some(x) => x,
                         None => return Ok::<(), anyhow::Error>(()),
                     };
@@ -1490,371 +1527,374 @@ async fn sync_hydra_jobsets(
                 .await
                 .with_context(|| format!("failed to process jobset {jobset_name}"))
                 .inspect_err(|err| eprintln!("{err:?}"));
-            }
-            Ok::<(), anyhow::Error>(())
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                .inspect_err(|err| eprintln!("{err:?}"));
         }
-        .await
-        .inspect_err(|err| eprintln!("{err:?}"));
     }
-}
 
-use github::{Installation, InstallationAction, InstallationRepositoriesAction, Payload};
-
-fn check_client_id(config: &Config, installation: &Installation) -> Result<(), warp::Rejection> {
-    if installation.client_id != config.github_app.client_id {
-        return Err(Error::Bad(format!(
-            "Unexpected app client ID: {}",
-            installation.client_id
-        ))
-        .into());
+    fn check_client_id(
+        config: &Config,
+        installation: &Installation,
+    ) -> Result<(), warp::Rejection> {
+        if installation.client_id != config.github_app.client_id {
+            return Err(Error::Bad(format!(
+                "Unexpected app client ID: {}",
+                installation.client_id
+            ))
+            .into());
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-fn warn_about_not_allowed_repositories<T: Iterator<Item = String>>(config: &Config, provided: T) {
-    let notallowed: Vec<_> = provided
-        .filter(|r| !config.repositories.contains_key(r))
-        .collect();
-    if !notallowed.is_empty() {
-        eprintln!(
-            "app was installed on repositories that are not allowed, events for these repositories will be ignored: {}",
-            notallowed
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct JobsetsTriggeredResponse {
-    pub jobsets_triggered: Vec<String>,
-}
-
-async fn handle_payload(
-    hydra_client: hydra::Client,
-    github_client: github::ApplicationClient,
-    config: std::sync::Arc<Config>,
-    payload: Payload,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    //eprintln!("handle_payload: {:?}", payload);
-    match payload {
-        Payload::Ping => (),
-        Payload::Installation(event) => {
-            check_client_id(&config, &event.installation)?;
-            if matches!(event.action, InstallationAction::Created) {
-                warn_about_not_allowed_repositories(
-                    &config,
-                    event.repositories.iter().map(|r| r.full_name.clone()),
-                )
-            }
+    fn warn_about_not_allowed_repositories<T: Iterator<Item = String>>(
+        config: &Config,
+        provided: T,
+    ) {
+        let notallowed: Vec<_> = provided
+            .filter(|r| !config.repositories.contains_key(r))
+            .collect();
+        if !notallowed.is_empty() {
             eprintln!(
-                "installation: {:?} for repositories: {}",
-                event.action,
-                event
-                    .repositories
+                "app was installed on repositories that are not allowed, events for these repositories will be ignored: {}",
+                notallowed
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
+    async fn handle_payload(
+        hydra_client: hydra::Client,
+        github_client: github::ApplicationClient,
+        config: std::sync::Arc<Config>,
+        payload: Payload,
+    ) -> Result<impl warp::Reply, warp::Rejection> {
+        //eprintln!("handle_payload: {:?}", payload);
+        match payload {
+            Payload::Ping => (),
+            Payload::Installation(event) => {
+                check_client_id(&config, &event.installation)?;
+                if matches!(event.action, InstallationAction::Created) {
+                    warn_about_not_allowed_repositories(
+                        &config,
+                        event.repositories.iter().map(|r| r.full_name.clone()),
+                    )
+                }
+                eprintln!(
+                    "installation: {:?} for repositories: {}",
+                    event.action,
+                    event
+                        .repositories
+                        .iter()
+                        .map(|r| r.full_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if let Ok(installation_client) =
+                    github_client.for_installation(event.installation.id).await
+                {
+                    for r in event.repositories {
+                        eprintln!("will configure check suite preferences for {}", r.full_name);
+                        let installation_client = installation_client.clone();
+                        tokio::spawn(async move {
+                            eprintln!("configuring check suite preferences for {}", r.full_name);
+                            let _ = installation_client
+                                .patch_check_suites_preferences(
+                                    r.full_name,
+                                    event.installation.app_id,
+                                    false,
+                                )
+                                .await
+                                .inspect_err(|err| eprintln!("{err}"));
+                        });
+                    }
+                }
+            }
+            Payload::InstallationRepositories(event) => {
+                check_client_id(&config, &event.installation)?;
+                if matches!(event.action, InstallationRepositoriesAction::Added) {
+                    warn_about_not_allowed_repositories(
+                        &config,
+                        event.repositories_added.iter().map(|r| r.full_name.clone()),
+                    )
+                }
+                eprintln!(
+                    "installation repositories: {:?} for repositories: {}",
+                    event.action,
+                    match event.action {
+                        InstallationRepositoriesAction::Added => event.repositories_added,
+                        InstallationRepositoriesAction::Removed => event.repositories_removed,
+                    }
                     .iter()
                     .map(|r| r.full_name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
-            if let Ok(installation_client) =
-                github_client.for_installation(event.installation.id).await
-            {
-                for r in event.repositories {
-                    eprintln!("will configure check suite preferences for {}", r.full_name);
-                    let installation_client = installation_client.clone();
-                    tokio::spawn(async move {
-                        eprintln!("configuring check suite preferences for {}", r.full_name);
-                        let _ = installation_client
-                            .patch_check_suites_preferences(
-                                r.full_name,
-                                event.installation.app_id,
-                                false,
+                );
+            }
+            Payload::PullRequest(event) => 'pr: {
+                eprintln!("got pull_request event: {:#?}", event);
+                if !matches!(
+                    event.action,
+                    github::PullRequestAction::Opened
+                        | github::PullRequestAction::Reopened
+                        | github::PullRequestAction::Synchronize
+                ) {
+                    break 'pr;
+                }
+                let repo_full_name = &event.repository.full_name;
+                let repo_config = match config.repositories.get(repo_full_name) {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("repository not found in config: {repo_full_name}");
+                        break 'pr;
+                    }
+                };
+                let installation_client = github_client
+                    .for_installation(event.installation.id)
+                    .await
+                    .context("couldn't get installation client")
+                    .map_err(Error::reject_internal)?;
+                let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
+                    &installation_client.get_client(),
+                    repo_full_name,
+                    event.pull_request.number,
+                    &event.pull_request.head.sha,
+                )
+                .await
+                .context("failed to wait for the merge commit")
+                .map_err(Error::reject_internal)?;
+                let jobset_id = format!(
+                    "pr-{}-{}",
+                    event.pull_request.number, event.pull_request.head.sha
+                );
+                let mut jobset = repo_config.hydra_jobset_template.clone();
+                // String::replace_first is only in nightly
+                if let Some((start, match_str)) =
+                    jobset.description.match_indices("{pr_url}").next()
+                {
+                    jobset.description.replace_range(
+                        start..start + match_str.len(),
+                        &event.pull_request.html_url,
+                    );
+                }
+                match jobset.definition {
+                    hydra::JobsetDefinition::Legacy { ref mut inputs, .. } => {
+                        for input in inputs.values_mut() {
+                            match input.r#type.as_str() {
+                                "pr merge" => {
+                                    input.r#type = "git".to_string();
+                                    input.value = format!(
+                                        "{} {merge_commit_sha}",
+                                        event.repository.clone_url
+                                    );
+                                }
+                                "pr base" => {
+                                    input.r#type = "git".to_string();
+                                    input.value = format!(
+                                        "{} {target_commit_sha}",
+                                        event.repository.clone_url
+                                    );
+                                }
+                                "pr head" => {
+                                    input.r#type = "git".to_string();
+                                    input.value = format!(
+                                        "{} {}",
+                                        event.repository.clone_url, event.pull_request.head.sha
+                                    );
+                                }
+                                _ => {}
+                            };
+                        }
+                        inputs.entry("repository_name".to_string()).insert_entry(
+                            hydra::JobsetInput {
+                                r#type: "string".to_string(),
+                                value: repo_full_name.clone(),
+                            },
+                        );
+                        inputs
+                            .entry("pr_number".to_string())
+                            .insert_entry(hydra::JobsetInput {
+                                r#type: "string".to_string(),
+                                value: event.pull_request.number.to_string(),
+                            });
+                    }
+                    hydra::JobsetDefinition::Flake { ref mut flake } => match flake.as_str() {
+                        "{pr merge}" => {
+                            *flake = format!("github:{repo_full_name}/{merge_commit_sha}")
+                        }
+                        "{pr base}" => {
+                            *flake = format!("github:{repo_full_name}/{target_commit_sha}")
+                        }
+                        "{pr head}" => {
+                            *flake =
+                                format!("github:{repo_full_name}/{}", event.pull_request.head.sha)
+                        }
+                        _ => {}
+                    },
+                }
+                let res = hydra_client
+                    .put_jobset(&config.hydra.project, &jobset_id, jobset)
+                    .await
+                    .inspect_err(|err| eprintln!("{err}"));
+                if res.is_ok() {
+                    let project_jobset = format!("{}:{}", config.hydra.project, jobset_id);
+                    if let Ok(jobsets_triggered) = hydra_client
+                        .trigger_jobset(&project_jobset)
+                        .await
+                        .inspect_err(|err| eprintln!("{err}"))
+                    {
+                        if !jobsets_triggered.contains(&project_jobset) {
+                            eprintln!("jobset {project_jobset} was not triggered");
+                        } else {
+                            eprintln!("jobset {project_jobset} was triggered successfully");
+                            let _ = github::upsert_check(
+                                &installation_client,
+                                config.github_app.app_id,
+                                &repo_config.check_run_name,
+                                repo_full_name,
+                                &event.pull_request.head.sha,
+                                &github::UpsertCheckRunData {
+                                    status: github::CheckRunStatus::Queued,
+                                    details_url: format!(
+                                        "{}/jobset/{}/{}",
+                                        config.hydra.url, config.hydra.project, jobset_id
+                                    ),
+                                },
                             )
                             .await
                             .inspect_err(|err| eprintln!("{err}"));
-                    });
-                }
-            }
-        }
-        Payload::InstallationRepositories(event) => {
-            check_client_id(&config, &event.installation)?;
-            if matches!(event.action, InstallationRepositoriesAction::Added) {
-                warn_about_not_allowed_repositories(
-                    &config,
-                    event.repositories_added.iter().map(|r| r.full_name.clone()),
-                )
-            }
-            eprintln!(
-                "installation repositories: {:?} for repositories: {}",
-                event.action,
-                match event.action {
-                    InstallationRepositoriesAction::Added => event.repositories_added,
-                    InstallationRepositoriesAction::Removed => event.repositories_removed,
-                }
-                .iter()
-                .map(|r| r.full_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-            );
-        }
-        Payload::PullRequest(event) => 'pr: {
-            eprintln!("got pull_request event: {:#?}", event);
-            if !matches!(
-                event.action,
-                github::PullRequestAction::Opened
-                    | github::PullRequestAction::Reopened
-                    | github::PullRequestAction::Synchronize
-            ) {
-                break 'pr;
-            }
-            let repo_full_name = &event.repository.full_name;
-            let repo_config = match config.repositories.get(repo_full_name) {
-                Some(c) => c,
-                None => {
-                    eprintln!("repository not found in config: {repo_full_name}");
-                    break 'pr;
-                }
-            };
-            let installation_client = github_client
-                .for_installation(event.installation.id)
-                .await
-                .context("couldn't get installation client")
-                .map_err(Error::reject_internal)?;
-            let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
-                &installation_client.get_client(),
-                repo_full_name,
-                event.pull_request.number,
-                &event.pull_request.head.sha,
-            )
-            .await
-            .context("failed to wait for the merge commit")
-            .map_err(Error::reject_internal)?;
-            let jobset_id = format!(
-                "pr-{}-{}",
-                event.pull_request.number, event.pull_request.head.sha
-            );
-            let mut jobset = repo_config.hydra_jobset_template.clone();
-            // String::replace_first is only in nightly
-            if let Some((start, match_str)) = jobset.description.match_indices("{pr_url}").next() {
-                jobset
-                    .description
-                    .replace_range(start..start + match_str.len(), &event.pull_request.html_url);
-            }
-            match jobset.definition {
-                hydra::JobsetDefinition::Legacy { ref mut inputs, .. } => {
-                    for input in inputs.values_mut() {
-                        match input.r#type.as_str() {
-                            "pr merge" => {
-                                input.r#type = "git".to_string();
-                                input.value =
-                                    format!("{} {merge_commit_sha}", event.repository.clone_url);
-                            }
-                            "pr base" => {
-                                input.r#type = "git".to_string();
-                                input.value =
-                                    format!("{} {target_commit_sha}", event.repository.clone_url);
-                            }
-                            "pr head" => {
-                                input.r#type = "git".to_string();
-                                input.value = format!(
-                                    "{} {}",
-                                    event.repository.clone_url, event.pull_request.head.sha
-                                );
-                            }
-                            _ => {}
-                        };
-                    }
-                    inputs
-                        .entry("repository_name".to_string())
-                        .insert_entry(hydra::JobsetInput {
-                            r#type: "string".to_string(),
-                            value: repo_full_name.clone(),
-                        });
-                    inputs
-                        .entry("pr_number".to_string())
-                        .insert_entry(hydra::JobsetInput {
-                            r#type: "string".to_string(),
-                            value: event.pull_request.number.to_string(),
-                        });
-                }
-                hydra::JobsetDefinition::Flake { ref mut flake } => match flake.as_str() {
-                    "{pr merge}" => *flake = format!("github:{repo_full_name}/{merge_commit_sha}"),
-                    "{pr base}" => *flake = format!("github:{repo_full_name}/{target_commit_sha}"),
-                    "{pr head}" => {
-                        *flake = format!("github:{repo_full_name}/{}", event.pull_request.head.sha)
-                    }
-                    _ => {}
-                },
-            }
-            let res = hydra_client
-                .put_jobset(&config.hydra.project, &jobset_id, jobset)
-                .await
-                .inspect_err(|err| eprintln!("{err}"));
-            if res.is_ok() {
-                let project_jobset = format!("{}:{}", config.hydra.project, jobset_id);
-                if let Ok(jobsets_triggered) = hydra_client
-                    .trigger_jobset(&project_jobset)
-                    .await
-                    .inspect_err(|err| eprintln!("{err}"))
-                {
-                    if !jobsets_triggered.contains(&project_jobset) {
-                        eprintln!("jobset {project_jobset} was not triggered");
-                    } else {
-                        eprintln!("jobset {project_jobset} was triggered successfully");
-                        let _ = github::upsert_check(
-                            &installation_client,
-                            config.github_app.app_id,
-                            &repo_config.check_run_name,
-                            repo_full_name,
-                            &event.pull_request.head.sha,
-                            &github::UpsertCheckRunData {
-                                status: github::CheckRunStatus::Queued,
-                                details_url: format!(
-                                    "{}/jobset/{}/{}",
-                                    config.hydra.url, config.hydra.project, jobset_id
-                                ),
-                            },
-                        )
-                        .await
-                        .inspect_err(|err| eprintln!("{err}"));
+                        }
                     }
                 }
             }
-        }
-    };
-    Ok(warp::reply::with_status(
-        "",
-        warp::http::StatusCode::NO_CONTENT,
-    ))
-}
-
-// Parse webhook payload
-
-#[allow(dead_code)]
-fn log_body(body: &bytes::Bytes) {
-    eprintln!(
-        "{}",
-        serde_json::from_slice::<serde_json::Value>(body)
-            .and_then(|v| serde_json::to_string_pretty(&v))
-            .unwrap_or("<couldn't parse body into Value>".into())
-    );
-}
-
-async fn parse_webhook(body: bytes::Bytes, event: String) -> Result<Payload, warp::Rejection> {
-    eprintln!("Got event: {}", event);
-    match event.as_str() {
-        "ping" => Ok(Payload::Ping),
-        "installation" => serde_json::from_slice(&body).map(Payload::Installation),
-        "installation_repositories" => {
-            serde_json::from_slice(&body).map(Payload::InstallationRepositories)
-        }
-        "pull_request" => serde_json::from_slice(&body).map(Payload::PullRequest),
-        // TODO: also handle check_run event so that user can click "re-run"
-        _ => {
-            //log_body(&body);
-            return Err(Error::Bad(format!("Unexpected event type: {}", event)).into());
-        }
+        };
+        Ok(warp::reply::with_status(
+            "",
+            warp::http::StatusCode::NO_CONTENT,
+        ))
     }
-    .with_context(|| format!("failed to parse {event}"))
-    .map_err(Error::reject_internal)
-}
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let arg = std::env::args().nth(1).ok_or_else(|| {
-        anyhow!(
-            "usage: {} <config>",
-            std::env::args().next().unwrap_or("<gh-app>".to_string())
+    // Parse webhook payload
+
+    #[allow(dead_code)]
+    fn log_body(body: &bytes::Bytes) {
+        eprintln!(
+            "{}",
+            serde_json::from_slice::<serde_json::Value>(body)
+                .and_then(|v| serde_json::to_string_pretty(&v))
+                .unwrap_or("<couldn't parse body into Value>".into())
+        );
+    }
+
+    async fn parse_webhook(body: bytes::Bytes, event: String) -> Result<Payload, warp::Rejection> {
+        eprintln!("Got event: {}", event);
+        match event.as_str() {
+            "ping" => Ok(Payload::Ping),
+            "installation" => serde_json::from_slice(&body).map(Payload::Installation),
+            "installation_repositories" => {
+                serde_json::from_slice(&body).map(Payload::InstallationRepositories)
+            }
+            "pull_request" => serde_json::from_slice(&body).map(Payload::PullRequest),
+            // TODO: also handle check_run event so that user can click "re-run"
+            _ => {
+                //log_body(&body);
+                return Err(Error::Bad(format!("Unexpected event type: {}", event)).into());
+            }
+        }
+        .with_context(|| format!("failed to parse {event}"))
+        .map_err(Error::reject_internal)
+    }
+
+    pub async fn run(cfg: Config) -> Result<()> {
+        let listen_address = cfg.listen;
+        let webhook_secret = std::fs::read_to_string(&cfg.github_app.webhook_secret_file)
+            .context("Unable to read webhook secret file")?;
+        let webhook_secret = webhook_secret.trim().to_string();
+
+        let hydra_client = hydra::Client::new(
+            &cfg.hydra.url,
+            &cfg.user_agent,
+            &cfg.hydra.user,
+            std::env::var(&cfg.hydra.password_env).context("couldn't read Hydra env var")?,
         )
-    })?;
-    let cfg = std::sync::Arc::new(load_config(arg.as_ref())?);
-    let listen_address = cfg.listen;
-    let webhook_secret = std::fs::read_to_string(&cfg.github_app.webhook_secret_file)
-        .context("Unable to read webhook secret file")?;
-    let webhook_secret = webhook_secret.trim().to_string();
+        .await?;
 
-    let hydra_client = hydra::Client::new(
-        &cfg.hydra.url,
-        &cfg.user_agent,
-        &cfg.hydra.user,
-        std::env::var(&cfg.hydra.password_env).context("couldn't read Hydra env var")?,
-    )
-    .await?;
-
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    let github_client = github::ApplicationClient::new(
-        &cfg.user_agent,
-        &cfg.github_app.client_id,
-        rsa::RsaPrivateKey::read_pkcs1_pem_file(cfg.github_app.app_private_key_file.as_str())
-            .with_context(|| {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        let github_client = github::ApplicationClient::new(
+            &cfg.user_agent,
+            &cfg.github_app.client_id,
+            rsa::RsaPrivateKey::read_pkcs1_pem_file(cfg.github_app.app_private_key_file.as_str())
+                .with_context(|| {
                 format!(
                     "couldn't read private key from {}",
                     cfg.github_app.app_private_key_file
                 )
             })?,
-    );
+        );
 
-    tokio::spawn(sync_hydra_jobsets(
-        cfg.clone(),
-        hydra_client.clone(),
-        github_client.clone(),
-    ));
+        let cfg = std::sync::Arc::new(cfg);
 
-    eprintln!("Will listen on {}", cfg.listen);
-    use warp::Filter;
-    let route = warp::path::end()
-        .and(warp::post())
-        .and(check_signature_filter(webhook_secret))
-        .and(warp::header::exact_ignore_case(
-            "content-type",
-            "application/json",
-        ))
-        .and(warp::header::<String>("X-GitHub-Event"))
-        .and_then(parse_webhook)
-        .and_then(move |payload| {
-            handle_payload(
-                hydra_client.clone(),
-                github_client.clone(),
-                cfg.clone(),
-                payload,
-            )
-        })
-        .recover(async |err: warp::Rejection| {
-            if let Some(e) = err.find::<Error>() {
-                match e {
-                    Error::Internal(e) => {
-                        eprintln!("got internal error: {:?}", e);
-                        Ok(warp::reply::with_status(
-                            "Internal error".to_string(),
-                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ))
+        tokio::spawn(sync_hydra_jobsets(
+            cfg.clone(),
+            hydra_client.clone(),
+            github_client.clone(),
+        ));
+        eprintln!("Will listen on {}", cfg.listen);
+        use warp::Filter;
+        let route = warp::path::end()
+            .and(warp::post())
+            .and(check_signature_filter(webhook_secret))
+            .and(warp::header::exact_ignore_case(
+                "content-type",
+                "application/json",
+            ))
+            .and(warp::header::<String>("X-GitHub-Event"))
+            .and_then(parse_webhook)
+            .and_then(move |payload| {
+                handle_payload(
+                    hydra_client.clone(),
+                    github_client.clone(),
+                    cfg.clone(),
+                    payload,
+                )
+            })
+            .recover(async |err: warp::Rejection| {
+                if let Some(e) = err.find::<Error>() {
+                    match e {
+                        Error::Internal(e) => {
+                            eprintln!("got internal error: {:?}", e);
+                            Ok(warp::reply::with_status(
+                                "Internal error".to_string(),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ))
+                        }
+                        Error::Bad(s) => {
+                            eprintln!("bad request: {}", s);
+                            Ok(warp::reply::with_status(
+                                s.clone(),
+                                warp::http::StatusCode::BAD_REQUEST,
+                            ))
+                        }
                     }
-                    Error::Bad(s) => {
-                        eprintln!("bad request: {}", s);
-                        Ok(warp::reply::with_status(
-                            s.clone(),
-                            warp::http::StatusCode::BAD_REQUEST,
-                        ))
-                    }
+                } else {
+                    Err(err)
                 }
-            } else {
-                Err(err)
-            }
-        })
-        .with(warp::log::custom(|info| {
-            eprintln!(
-                "{} {} {} {:?}",
-                info.method(),
-                info.path(),
-                info.status(),
-                info.request_headers(),
-            );
-        }));
-    warp::serve(route).run(listen_address).await;
-    Ok(())
+            })
+            .with(warp::log::custom(|info| {
+                eprintln!(
+                    "{} {} {} {:?}",
+                    info.method(),
+                    info.path(),
+                    info.status(),
+                    info.request_headers(),
+                );
+            }));
+        warp::serve(route).run(listen_address).await;
+        Ok(())
+    }
 }
