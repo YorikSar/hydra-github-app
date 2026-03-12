@@ -8,19 +8,26 @@ When a new jobset is created, a new check is created on the target commit in *qu
 
 ## Usage
 
-You can run this project with either:
+You can run this project with either `nix run github:YorikSar/hydra-github-app config.json` or `cargo run config.json` passing the `config.json` with all the configuration as the argument.
+You can also install the binary and call it directly, for example:
 
 ```
-nix run . config.json
+$ nix shell github:YorikSar/hydra-github-app
+$ hydra-github-app config.json
 ```
 
-or
+### CLI mode
+
+You can also just create one jobset from one PR by running:
 
 ```
-cargo run config.json
+hydra-github-app config.json one_pr <PR URL>
 ```
 
-passing the `config.json` with all the configuration as the argument.
+Where `<PR URL>` is a direct URL to a PR on GitHub in a repository mentioned in the config, for example, `https://github.com/YorikSar/hydra-github-app/pull/1`.
+It will expect `GITHUB_TOKEN` environment variable to be set to a valid user or installation GitHub token that has access to this pull request.
+
+This will trigger almost the same reaction as if webhook received a payload for this pull request, except it won't create any checks on the PR and will exit after the jobset is triggered.
 
 ### Set up
 

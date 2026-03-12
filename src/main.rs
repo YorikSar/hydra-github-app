@@ -49,22 +49,84 @@ async fn main() -> Result<()> {
         .next()
         .map(|os_str| os_str.to_string_lossy().to_string())
         .unwrap_or("<hydra-github-app>".to_string());
-    let usage = || anyhow!("usage: {program_name} <config> [webhook]");
+    let usage = || anyhow!("usage: {program_name} <config> [{{webhook|one_pr <pr_url>}}]");
     let config_file_name = args.next().ok_or_else(usage)?;
     let action = args.next().map_or_else(
         || "webhook".to_string(),
         |s| s.to_string_lossy().to_string(),
     );
+
+    // ugly way to get a reference to different async functions
+    let run_fn: Box<dyn FnOnce(Config) -> std::pin::Pin<Box<dyn std::future::Future<Output = _>>>> =
+        match action.as_ref() {
+            "webhook" => Box::new(|cfg| Box::pin(webhook::run(cfg))),
+            "one_pr" => {
+                let pull_request_url = args.next().ok_or_else(usage)?.to_string_lossy().to_string();
+                Box::new(|cfg| Box::pin(do_one_pr(cfg, pull_request_url)))
+            }
+            _ => return Err(usage()),
+        };
     if args.next().is_some() {
         return Err(usage());
     }
-
     let cfg = load_config(config_file_name.as_ref())?;
-    let run_fn = match action.as_ref() {
-        "webhook" => webhook::run,
-        _ => return Err(usage()),
-    };
     run_fn(cfg).await
+}
+
+fn parse_pr_url(pull_request_url: &str) -> Option<(String, u64)> {
+    let url = url::Url::parse(pull_request_url).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return None;
+    }
+    let [empty, org, repo, pull, pr_number_str] = url.path().split('/').collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if !empty.is_empty() || pull != "pull" {
+        return None;
+    }
+    Some((format!("{org}/{repo}"), pr_number_str.parse().ok()?))
+}
+
+async fn do_one_pr(cfg: Config, pull_request_url: String) -> Result<()> {
+    let Some((repo_full_name, pr_number)) = parse_pr_url(&pull_request_url) else {
+        return Err(anyhow!(
+            "URL must point to a PR as in https://github.com/org/repo/pull/123"
+        ));
+    };
+    let Some(repo_config) = cfg.repositories.get(&repo_full_name) else {
+        return Err(anyhow!("repository not found in config: {repo_full_name}"));
+    };
+
+    let hydra_client = hydra::Client::new(
+        &cfg.hydra.url,
+        &cfg.user_agent,
+        &cfg.hydra.user,
+        std::env::var(&cfg.hydra.password_env).context("couldn't read Hydra env var")?,
+    )
+    .await?;
+
+    let github_client = github::Client::new(
+        &cfg.user_agent,
+        std::env::var("GITHUB_TOKEN")
+            .context("couldn't get GitHub token from GITHUB_TOKEN env var")?,
+    );
+
+    let pull_request = github_client
+        .get_pull_request(&repo_full_name, pr_number)
+        .await?;
+
+    let _jobset_id = create_jobset_for_pr(
+        &github_client,
+        &hydra_client,
+        &cfg,
+        repo_config,
+        &repo_full_name,
+        &pull_request,
+    )
+    .await?;
+
+    Ok(())
 }
 
 mod github {
@@ -421,6 +483,17 @@ mod github {
     }
 
     impl Client {
+        pub fn new(user_agent: &str, token: String) -> Self {
+            Self {
+                http_client: reqwest::ClientBuilder::new()
+                    //.connection_verbose(true)
+                    .user_agent(user_agent)
+                    .build()
+                    .expect("couldn't build client"),
+                token,
+            }
+        }
+
         pub async fn get_pull_request(
             &self,
             repo_full_name: &str,
