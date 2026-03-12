@@ -1260,6 +1260,83 @@ fn test_parse_jobset_name() {
     );
 }
 
+async fn create_jobset_for_pr(
+    github_client: &github::Client,
+    hydra_client: &hydra::Client,
+    config: &Config,
+    repo_config: &RepoConfig,
+    repo_full_name: &str,
+    pull_request: &github::PullRequest,
+) -> Result<String> {
+    let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
+        github_client,
+        repo_full_name,
+        pull_request.number,
+        &pull_request.head.sha,
+    )
+    .await
+    .context("failed to wait for the merge commit")?;
+    let jobset_id = format!("pr-{}-{}", pull_request.number, pull_request.head.sha);
+    let mut jobset = repo_config.hydra_jobset_template.clone();
+    // String::replace_first is only in nightly
+    if let Some((start, match_str)) = jobset.description.match_indices("{pr_url}").next() {
+        jobset
+            .description
+            .replace_range(start..start + match_str.len(), &pull_request.html_url);
+    }
+    match jobset.definition {
+        hydra::JobsetDefinition::Legacy { ref mut inputs, .. } => {
+            let clone_url = format!("https://github.com/{repo_full_name}.git");
+            for input in inputs.values_mut() {
+                match input.r#type.as_str() {
+                    "pr merge" => {
+                        input.r#type = "git".to_string();
+                        input.value = format!("{clone_url} {merge_commit_sha}");
+                    }
+                    "pr base" => {
+                        input.r#type = "git".to_string();
+                        input.value = format!("{clone_url} {target_commit_sha}");
+                    }
+                    "pr head" => {
+                        input.r#type = "git".to_string();
+                        input.value = format!("{clone_url} {}", pull_request.head.sha);
+                    }
+                    _ => {}
+                };
+            }
+            inputs
+                .entry("repository_name".to_string())
+                .insert_entry(hydra::JobsetInput {
+                    r#type: "string".to_string(),
+                    value: repo_full_name.to_string(),
+                });
+            inputs
+                .entry("pr_number".to_string())
+                .insert_entry(hydra::JobsetInput {
+                    r#type: "string".to_string(),
+                    value: pull_request.number.to_string(),
+                });
+        }
+        hydra::JobsetDefinition::Flake { ref mut flake } => match flake.as_str() {
+            "{pr merge}" => *flake = format!("github:{repo_full_name}/{merge_commit_sha}"),
+            "{pr base}" => *flake = format!("github:{repo_full_name}/{target_commit_sha}"),
+            "{pr head}" => *flake = format!("github:{repo_full_name}/{}", pull_request.head.sha),
+            _ => {}
+        },
+    }
+    hydra_client
+        .put_jobset(&config.hydra.project, &jobset_id, jobset)
+        .await?;
+    let project_jobset = format!("{}:{}", config.hydra.project, jobset_id);
+    let jobsets_triggered = hydra_client.trigger_jobset(&project_jobset).await?;
+
+    if !jobsets_triggered.contains(&project_jobset) {
+        return Err(anyhow!("jobset {project_jobset} was not triggered"));
+    }
+    eprintln!("jobset {project_jobset} was triggered successfully");
+    Ok(jobset_id)
+}
+
 mod webhook {
     use crate::github::{
         Installation, InstallationAction, InstallationRepositoriesAction, Payload,
@@ -1659,118 +1736,32 @@ mod webhook {
                     .await
                     .context("couldn't get installation client")
                     .map_err(Error::reject_internal)?;
-                let (merge_commit_sha, target_commit_sha) = github::ensure_pr_merge_commit(
+                let jobset_id = crate::create_jobset_for_pr(
                     &installation_client.get_client(),
+                    &hydra_client,
+                    &config,
+                    repo_config,
                     repo_full_name,
-                    event.pull_request.number,
-                    &event.pull_request.head.sha,
+                    &event.pull_request,
                 )
                 .await
-                .context("failed to wait for the merge commit")
                 .map_err(Error::reject_internal)?;
-                let jobset_id = format!(
-                    "pr-{}-{}",
-                    event.pull_request.number, event.pull_request.head.sha
-                );
-                let mut jobset = repo_config.hydra_jobset_template.clone();
-                // String::replace_first is only in nightly
-                if let Some((start, match_str)) =
-                    jobset.description.match_indices("{pr_url}").next()
-                {
-                    jobset.description.replace_range(
-                        start..start + match_str.len(),
-                        &event.pull_request.html_url,
-                    );
-                }
-                match jobset.definition {
-                    hydra::JobsetDefinition::Legacy { ref mut inputs, .. } => {
-                        for input in inputs.values_mut() {
-                            match input.r#type.as_str() {
-                                "pr merge" => {
-                                    input.r#type = "git".to_string();
-                                    input.value = format!(
-                                        "{} {merge_commit_sha}",
-                                        event.repository.clone_url
-                                    );
-                                }
-                                "pr base" => {
-                                    input.r#type = "git".to_string();
-                                    input.value = format!(
-                                        "{} {target_commit_sha}",
-                                        event.repository.clone_url
-                                    );
-                                }
-                                "pr head" => {
-                                    input.r#type = "git".to_string();
-                                    input.value = format!(
-                                        "{} {}",
-                                        event.repository.clone_url, event.pull_request.head.sha
-                                    );
-                                }
-                                _ => {}
-                            };
-                        }
-                        inputs.entry("repository_name".to_string()).insert_entry(
-                            hydra::JobsetInput {
-                                r#type: "string".to_string(),
-                                value: repo_full_name.clone(),
-                            },
-                        );
-                        inputs
-                            .entry("pr_number".to_string())
-                            .insert_entry(hydra::JobsetInput {
-                                r#type: "string".to_string(),
-                                value: event.pull_request.number.to_string(),
-                            });
-                    }
-                    hydra::JobsetDefinition::Flake { ref mut flake } => match flake.as_str() {
-                        "{pr merge}" => {
-                            *flake = format!("github:{repo_full_name}/{merge_commit_sha}")
-                        }
-                        "{pr base}" => {
-                            *flake = format!("github:{repo_full_name}/{target_commit_sha}")
-                        }
-                        "{pr head}" => {
-                            *flake =
-                                format!("github:{repo_full_name}/{}", event.pull_request.head.sha)
-                        }
-                        _ => {}
+                let _ = github::upsert_check(
+                    &installation_client,
+                    config.github_app.app_id,
+                    &repo_config.check_run_name,
+                    repo_full_name,
+                    &event.pull_request.head.sha,
+                    &github::UpsertCheckRunData {
+                        status: github::CheckRunStatus::Queued,
+                        details_url: format!(
+                            "{}/jobset/{}/{}",
+                            config.hydra.url, config.hydra.project, jobset_id
+                        ),
                     },
-                }
-                let res = hydra_client
-                    .put_jobset(&config.hydra.project, &jobset_id, jobset)
-                    .await
-                    .inspect_err(|err| eprintln!("{err}"));
-                if res.is_ok() {
-                    let project_jobset = format!("{}:{}", config.hydra.project, jobset_id);
-                    if let Ok(jobsets_triggered) = hydra_client
-                        .trigger_jobset(&project_jobset)
-                        .await
-                        .inspect_err(|err| eprintln!("{err}"))
-                    {
-                        if !jobsets_triggered.contains(&project_jobset) {
-                            eprintln!("jobset {project_jobset} was not triggered");
-                        } else {
-                            eprintln!("jobset {project_jobset} was triggered successfully");
-                            let _ = github::upsert_check(
-                                &installation_client,
-                                config.github_app.app_id,
-                                &repo_config.check_run_name,
-                                repo_full_name,
-                                &event.pull_request.head.sha,
-                                &github::UpsertCheckRunData {
-                                    status: github::CheckRunStatus::Queued,
-                                    details_url: format!(
-                                        "{}/jobset/{}/{}",
-                                        config.hydra.url, config.hydra.project, jobset_id
-                                    ),
-                                },
-                            )
-                            .await
-                            .inspect_err(|err| eprintln!("{err}"));
-                        }
-                    }
-                }
+                )
+                .await
+                .inspect_err(|err| eprintln!("{err}"));
             }
         };
         Ok(warp::reply::with_status(
