@@ -26,6 +26,7 @@ hydra-github-app config.json one_pr <PR URL>
 
 Where `<PR URL>` is a direct URL to a PR on GitHub in a repository mentioned in the config, for example, `https://github.com/YorikSar/hydra-github-app/pull/1`.
 It will expect `GITHUB_TOKEN` environment variable to be set to a valid user or installation GitHub token that has access to this pull request.
+In this mode only `user_agent`, `hydra` and `repositories` sections of the config are required.
 
 This will trigger almost the same reaction as if webhook received a payload for this pull request, except it won't create any checks on the PR and will exit after the jobset is triggered.
 
