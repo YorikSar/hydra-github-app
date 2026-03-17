@@ -68,7 +68,7 @@ To create and install GitHub app:
 
 Configuration file is a JSON with following fields:
 
-* `listen` is a string containing IPv4 or IPv6 address and port to that the webhook server will listen on (see Rust stdlib documentation for the supported textual representations for [IPv4](https://doc.rust-lang.org/std/net/struct.SocketAddrV4.html#textual-representation) and [IPv6](https://doc.rust-lang.org/std/net/struct.SocketAddrV6.html#textual-representation)).
+* `listen` is a string containing IPv4 or IPv6 address and port that the webhook server will listen on (see Rust stdlib documentation for the supported textual representations for [IPv4](https://doc.rust-lang.org/std/net/struct.SocketAddrV4.html#textual-representation) and [IPv6](https://doc.rust-lang.org/std/net/struct.SocketAddrV6.html#textual-representation)).
 * `user_agent` is a string that will be used as `User-Agent` header for HTTP requests. GitHub [requires](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api?apiVersion=2022-11-28#user-agent-required) it to be valid.
 * `github_app` is an object with GitHub app config with following properties:
     * `webhook_secret_file` is a path to the file containing GitHub webhook secret. It can be any text specified during webhook creation in GitHub.
@@ -144,4 +144,301 @@ Configuration file is a JSON with following fields:
     }
 }
 ```
+</details>
+
+### NixOS module
+
+You can also use the provided NixOS module to run this app as a systemd daemon on your NixOS system.
+
+<details>
+<summary>Generated NixOS module documentation</summary>
+
+<!--begin generated NixOS module documentation-->
+## services\.hydra-github-app\.enable
+
+Whether to enable hydra-github-app\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+
+
+*Example:*
+
+```nix
+true
+```
+
+
+
+## services\.hydra-github-app\.package
+
+
+
+The hydra-github-app package to use\.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+
+```nix
+pkgs.callPacakges ./package.nix
+```
+
+
+
+## services\.hydra-github-app\.settings
+
+
+
+Configuration options that will be passed to the daemon
+
+
+
+*Type:*
+submodule
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+
+
+## services\.hydra-github-app\.settings\.github_app\.app_id
+
+
+
+the ID of the GitHub app, can be obtained on the GitHub app’s settings page
+
+
+
+*Type:*
+positive integer, meaning >0
+
+
+
+## services\.hydra-github-app\.settings\.github_app\.app_private_key_file
+
+
+
+a path to the file containing GitHub app’s private key generated in the GitHub app’s settings
+
+
+
+*Type:*
+absolute path not in the Nix store
+
+
+
+## services\.hydra-github-app\.settings\.github_app\.client_id
+
+
+
+the client ID of the GitHub app, can be obtained on the GitHub app’s settings page
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.github_app\.webhook_secret_file
+
+
+
+a path to the file containing GitHub webhook secret\. It can be any text specified during webhook creation in GitHub
+
+
+
+*Type:*
+absolute path not in the Nix store
+
+
+
+## services\.hydra-github-app\.settings\.hydra\.password_env
+
+
+
+environment variable with password used to authenticate in Hydra
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.hydra\.project
+
+
+
+name of the project in Hydra where jobsets will be created and watched
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.hydra\.url
+
+
+
+the base URL for Hydra instance where jobsets will be created
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.hydra\.user
+
+
+
+user name used to authenticate in Hydra
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.listen
+
+
+
+IPv4 or IPv6 address and port that the webhook server will listen on (see Rust stdlib documentation for the supported textual representations for [IPv4](https://doc\.rust-lang\.org/std/net/struct\.SocketAddrV4\.html\#textual-representation) and [IPv6](https://doc\.rust-lang\.org/std/net/struct\.SocketAddrV6\.html\#textual-representation))
+
+
+
+*Type:*
+non-empty string
+
+
+
+*Example:*
+
+```nix
+"127.0.0.1:3000"
+```
+
+
+
+## services\.hydra-github-app\.settings\.repositories
+
+
+
+an object with full names (` "ORG/REPO" `) of the GitHub repositories that are allowed to trigger Hydra builds as keys
+
+
+
+*Type:*
+attribute set of (submodule)
+
+
+
+## services\.hydra-github-app\.settings\.repositories\.\<name>\.check_per_job
+
+
+
+if enabled, every job in the jobset will be represented as a separate check named after its attribute path
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+
+
+## services\.hydra-github-app\.settings\.repositories\.\<name>\.check_run_name
+
+
+
+the name of the check representing the whole jobset that will be created on each commit
+
+
+
+*Type:*
+non-empty string
+
+
+
+## services\.hydra-github-app\.settings\.repositories\.\<name>\.hydra_jobset_template
+
+
+
+a representation of Hydra jobset configuration with following allowances:
+
+ - ` description ` field can contain ` {pr_url} ` string that will be replaced with the URL of the PR that triggered this jobset;
+ - ` inputs ` for legacy jobsets can contain inputs with no values with special types:
+   
+    - ` pr head ` will be replaced with ` git ` input pointing to the tip of the PR’s branch;
+    - ` pr base ` will be replaced with ` git ` input pointing to the tip of the PR’s target branch;
+    - ` pr merge ` will be replaced with ` git ` input pointing to the PR merge commit generated by GitHub;
+ - special string inputs will be added:
+   
+    - ` repository_name ` containing the name of the repository from which the jobset was triggered;
+    - ` pr_number ` containing the number of the PR that triggered the jobset\.
+ - ` flake ` field if present can match ` {pr head} `, ` {pr base} ` or ` {pr merge} ` to be replaced with the appropriate flake URI (see above)
+
+
+
+*Type:*
+JSON value
+
+
+
+## services\.hydra-github-app\.settings\.user_agent
+
+
+
+a string that will be used as ` User-Agent ` header for HTTP requests\. GitHub [requires](https://docs\.github\.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api?apiVersion=2022-11-28\#user-agent-required) it to be valid
+
+
+
+*Type:*
+non-empty string
+
+
+
+*Example:*
+
+```nix
+"my-hydra-app"
+```
+
+
+<!--end generated NixOS module documentation-->
 </details>
