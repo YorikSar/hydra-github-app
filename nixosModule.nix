@@ -6,6 +6,33 @@
 }:
 let
   cfg = config.services.hydra-github-app;
+  configJSON = pkgs.writers.writeJSON "config.json" (
+    cfg.settings
+    // {
+      github_app =
+        lib.removeAttrs cfg.settings.github_app [
+          "webhook_secret_file"
+          "app_private_key_file"
+        ]
+        // {
+          webhook_secret.env_file_name = "GITHUB_APP_WEBHOOK_SECRET_PATH";
+          app_private_key.env_file_name = "GITHUB_APP_PRIVATE_KEY_PATH";
+        };
+      hydra = lib.removeAttrs cfg.settings.hydra [ "password_file" ] // {
+        password.env_file_name = "HYDRA_PASSWORD_PATH";
+      };
+    }
+  );
+  loadCredential = [
+    "github_app_webhook_secret:${cfg.settings.github_app.webhook_secret_file}"
+    "github_app_private_key:${cfg.settings.github_app.app_private_key_file}"
+    "hydra_password:${cfg.settings.hydra.password_file}"
+  ];
+  environment = {
+    "GITHUB_APP_WEBHOOK_SECRET_PATH" = "%d/github_app_webhook_secret";
+    "GITHUB_APP_PRIVATE_KEY_PATH" = "%d/github_app_private_key";
+    "HYDRA_PASSWORD_PATH" = "%d/hydra_password";
+  };
 in
 {
   options.services.hydra-github-app = {
@@ -56,10 +83,9 @@ in
               description = "user name used to authenticate in Hydra";
               type = lib.types.nonEmptyStr;
             };
-            # FIXME: pass password as file or smth
-            password_env = lib.mkOption {
-              description = "environment variable with password used to authenticate in Hydra";
-              type = lib.types.nonEmptyStr;
+            password_file = lib.mkOption {
+              description = "a path to the file containing password used to authenticate in Hydra";
+              type = lib.types.externalPath;
             };
             project = lib.mkOption {
               description = "name of the project in Hydra where jobsets will be created and watched";
@@ -112,13 +138,15 @@ in
         Type = "simple";
         DynamicUser = true;
         ExecStart = ''
-          ${pkgs.lib.getExe cfg.package} ${pkgs.writers.writeJSON "config.json" cfg.settings} webhook
+          ${pkgs.lib.getExe cfg.package} ${configJSON} webhook
         '';
         Restart = "on-failure";
         RestartSec = "5s";
         StandardOutput = "journal";
         StandardError = "journal";
+        LoadCredential = loadCredential;
       };
+      inherit environment;
     };
   };
 }

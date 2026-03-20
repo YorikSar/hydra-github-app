@@ -1,9 +1,42 @@
 use anyhow::{Context, Result, anyhow};
 
 #[derive(serde::Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum SecretFromFileOrEnv {
+    Env(String),
+    FileName(String),
+    EnvFileName(String),
+}
+
+impl SecretFromFileOrEnv {
+    fn get(self) -> Result<Vec<u8>> {
+        fn trim_last_newline(mut v: Vec<u8>) -> Vec<u8> {
+            v.pop_if(|b| *b == '\n' as u8);
+            v
+        }
+
+        match self {
+            SecretFromFileOrEnv::Env(var_name) => std::env::var_os(&var_name)
+                .with_context(|| format!("environment variable {var_name:?} is not set"))
+                .map(|r| r.into_encoded_bytes()),
+            SecretFromFileOrEnv::FileName(file_name) => std::fs::read(&file_name)
+                .with_context(|| format!("couldn't read file {file_name:?}"))
+                .map(trim_last_newline),
+            SecretFromFileOrEnv::EnvFileName(var_name) => std::env::var_os(&var_name)
+                .with_context(|| format!("environment variable {var_name:?} is not set"))
+                .and_then(|file_name| {
+                    std::fs::read(&file_name)
+                        .with_context(|| format!("couldn't read file {file_name:?}"))
+                        .map(trim_last_newline)
+                }),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Debug)]
 struct GitHubAppConfig {
-    pub webhook_secret_file: String,
-    pub app_private_key_file: String,
+    pub webhook_secret: SecretFromFileOrEnv,
+    pub app_private_key: SecretFromFileOrEnv,
     pub app_id: u64,
     pub client_id: String,
 }
@@ -12,7 +45,7 @@ struct GitHubAppConfig {
 struct HydraConfig {
     pub url: String,
     pub user: String,
-    pub password_env: String,
+    pub password: SecretFromFileOrEnv,
     pub project: String,
 }
 
@@ -102,7 +135,10 @@ async fn do_one_pr(cfg: Config, pull_request_url: String) -> Result<()> {
         &cfg.hydra.url,
         &cfg.user_agent,
         &cfg.hydra.user,
-        std::env::var(&cfg.hydra.password_env).context("couldn't read Hydra env var")?,
+        cfg.hydra
+            .password
+            .get()
+            .context("couldn't get Hydra password")?,
     )
     .await?;
 
@@ -135,12 +171,12 @@ mod github {
     // Signature verification
 
     pub async fn check_signature(
-        secret: String,
+        secret: &[u8],
         sig: Vec<u8>,
         body: bytes::Bytes,
     ) -> Result<bytes::Bytes> {
         use hmac::{Hmac, Mac};
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret)
             .expect("Hmac can derives keys from slices of any length");
         mac.update(body.as_ref());
         if mac.verify_slice(sig.as_slice()).is_err() {
@@ -1126,7 +1162,7 @@ mod hydra {
             base_url: &str,
             user_agent: &str,
             username: &str,
-            password: String,
+            password: Vec<u8>,
         ) -> Result<Client> {
             let http_client = reqwest::ClientBuilder::new()
                 .user_agent(user_agent)
@@ -1150,7 +1186,7 @@ mod hydra {
                 .header(reqwest::header::REFERER, base_url)
                 .json(&serde_json::json!({
                     "username": username,
-                    "password": password,
+                    "password": String::from_utf8_lossy(&password),
                 }))
                 .send()
                 .await?
@@ -1432,14 +1468,13 @@ mod webhook {
     }
 
     fn check_signature_filter(
-        secret: String,
+        secret: Vec<u8>,
     ) -> impl warp::Filter<Extract = (bytes::Bytes,), Error = warp::Rejection>
     + Clone
     + Send
     + Sync
     + 'static {
         use futures_util::TryFutureExt;
-        let secret = std::sync::Arc::new(secret);
         use warp::Filter;
         warp::header::<String>("X-Hub-Signature-256")
             .and_then(async |header| {
@@ -1449,9 +1484,15 @@ mod webhook {
             })
             .and(warp::body::content_length_limit(1024 * 1024))
             .and(warp::body::bytes())
-            .and_then(move |sig, body| {
-                github::check_signature(secret.clone().to_string(), sig, body)
-                    .map_err(Error::reject_internal)
+            .and_then({
+                let secret = std::sync::Arc::new(secret);
+                move |sig, body| {
+                    (async |secret: std::sync::Arc<Vec<u8>>, sig, body| {
+                        github::check_signature(&secret.clone(), sig, body)
+                            .map_err(Error::reject_internal)
+                            .await
+                    })(secret.clone(), sig, body)
+                }
             })
     }
 
@@ -1459,9 +1500,7 @@ mod webhook {
     async fn test_signature_verification() {
         use warp::Filter;
         let filter = warp::post()
-            .and(check_signature_filter(
-                "It's a Secret to Everybody".to_owned(),
-            ))
+            .and(check_signature_filter("It's a Secret to Everybody".into()))
             .map(|_| warp::reply());
 
         let response = warp::test::request()
@@ -1888,15 +1927,19 @@ mod webhook {
                 "config must contain \"listen\" and \"github_app\" fields"
             ));
         };
-        let webhook_secret = std::fs::read_to_string(&app_cfg.webhook_secret_file)
-            .context("Unable to read webhook secret file")?;
-        let webhook_secret = webhook_secret.trim().to_string();
+        let webhook_secret = app_cfg
+            .webhook_secret
+            .get()
+            .context("couldn't get webhook secret")?;
 
         let hydra_client = hydra::Client::new(
             &hydra_cfg.url,
             &user_agent,
             &hydra_cfg.user,
-            std::env::var(&hydra_cfg.password_env).context("couldn't read Hydra env var")?,
+            hydra_cfg
+                .password
+                .get()
+                .context("couldn't get Hydra password")?,
         )
         .await?;
         let hydra_project = hydra_cfg.project;
@@ -1905,13 +1948,13 @@ mod webhook {
         let github_client = github::ApplicationClient::new(
             &user_agent,
             &app_cfg.client_id,
-            rsa::RsaPrivateKey::read_pkcs1_pem_file(app_cfg.app_private_key_file.as_str())
-                .with_context(|| {
-                    format!(
-                        "couldn't read private key from {}",
-                        app_cfg.app_private_key_file
-                    )
-                })?,
+            rsa::RsaPrivateKey::from_pkcs1_pem(&String::from_utf8_lossy(
+                &app_cfg
+                    .app_private_key
+                    .get()
+                    .context("couldn't get app private key")?,
+            ))
+            .context("couldn't parse app private key")?,
         );
         let repositories_cfg = std::sync::Arc::new(repositories_cfg);
         let crate::GitHubAppConfig {

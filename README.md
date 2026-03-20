@@ -66,18 +66,26 @@ To create and install GitHub app:
 
 ### Configuration
 
-Configuration file is a JSON with following fields:
+Configuration file is a plain JSON. Secrets are represented as objects with one of following fields:
+
+* `env` will read the secret from the environment variable with the provided name
+* `file_name` will read the secret from the file with the provided name
+* `env_file_name` will read the secret from the file with the name read from the environment variable with the provided name
+
+When read from a file, if a secret ends with a newline, it will be removed.
+
+Configuration contains following fields:
 
 * `listen` is a string containing IPv4 or IPv6 address and port that the webhook server will listen on (see Rust stdlib documentation for the supported textual representations for [IPv4](https://doc.rust-lang.org/std/net/struct.SocketAddrV4.html#textual-representation) and [IPv6](https://doc.rust-lang.org/std/net/struct.SocketAddrV6.html#textual-representation)).
 * `user_agent` is a string that will be used as `User-Agent` header for HTTP requests. GitHub [requires](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api?apiVersion=2022-11-28#user-agent-required) it to be valid.
 * `github_app` is an object with GitHub app config with following properties:
-    * `webhook_secret_file` is a path to the file containing GitHub webhook secret. It can be any text specified during webhook creation in GitHub.
-    * `app_private_key_file` is a path to the file containing GitHub app's private key generated in the GitHub app's settings.
+    * `webhook_secret` is a secret containing GitHub webhook secret. It can be any text specified during webhook creation in GitHub.
+    * `app_private_key` is a secret containing GitHub app's private key generated in the GitHub app's settings.
     * `app_id` is the ID of the GitHub app, can be obtained on the GitHub app's settings page.
     * `client_id` is the client ID of the GitHub app, can be obtained on the GitHub app's settings page.
 * `hydra` is an object with Hydra config with following properties:
     * `url` is the base URL for Hydra instance where jobsets will be created.
-    * `user` and `password_env` are user name and the name of the environment variable containing the password that will be used to authenticate in Hydra.
+    * `user` and `password` are user name and the secret containing the password that will be used to authenticate in Hydra.
     * `project` is the name of the project in Hydra where jobsets will be created and watched.
 * `repositories` is an object with full names (`"ORG/REPO"`) of the GitHub repositories that are allowed to trigger Hydra builds as keys and following properties:
     * `check_run_name` is the name of the check representing the whole jobset that will be created on each commit.
@@ -101,15 +109,21 @@ Configuration file is a JSON with following fields:
     "listen": "127.0.0.1:3000",
     "user_agent": "Hi I am a GitHub app",
     "github_app": {
-        "webhook_secret_file": "secret",
-        "app_private_key_file": "private-key.pem",
+        "webhook_secret": {
+            "file_name": "secret"
+        },
+        "app_private_key": {
+            "file_name": "private-key.pem"
+        },
         "app_id": 1234567,
         "client_id": "WFzzq5HUHbp8T484TFRT"
     },
     "hydra": {
         "url": "https://hydra.example.org",
         "user": "admin",
-        "password_env": "HYDRA_PASSWORD",
+        "password": {
+            "env": "HYDRA_PASSWORD"
+        },
         "project": "pr-tests"
     },
     "repositories": {
