@@ -289,16 +289,16 @@ absolute path not in the Nix store
 
 
 
-## services\.hydra-github-app\.settings\.hydra\.password_env
+## services\.hydra-github-app\.settings\.hydra\.password_file
 
 
 
-environment variable with password used to authenticate in Hydra
+a path to the file containing password used to authenticate in Hydra
 
 
 
 *Type:*
-non-empty string
+absolute path not in the Nix store
 
 
 
