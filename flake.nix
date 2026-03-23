@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     git-hooks-nix = {
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -37,7 +37,10 @@
           modulesEval = nixpkgs.lib.evalModules {
             modules = [
               self.nixosModules.default
-              { _module.check = false; }
+              {
+                _module.check = false;
+                _module.args.pkgs = nixpkgs.legacyPackages.x86_64-linux;
+              }
             ];
           };
         in

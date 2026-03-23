@@ -180,18 +180,12 @@ boolean
 
 
 *Default:*
-
-```nix
-false
-```
+` false `
 
 
 
 *Example:*
-
-```nix
-true
-```
+` true `
 
 
 
@@ -209,10 +203,7 @@ package
 
 
 *Default:*
-
-```nix
-pkgs.callPacakges ./package.nix
-```
+` pkgs.callPacakges ./package.nix `
 
 
 
@@ -230,10 +221,7 @@ submodule
 
 
 *Default:*
-
-```nix
-{ }
-```
+` { } `
 
 
 
@@ -355,10 +343,7 @@ non-empty string
 
 
 *Example:*
-
-```nix
-"127.0.0.1:3000"
-```
+` "127.0.0.1:3000" `
 
 
 
@@ -389,10 +374,7 @@ boolean
 
 
 *Default:*
-
-```nix
-false
-```
+` false `
 
 
 
@@ -448,10 +430,7 @@ non-empty string
 
 
 *Example:*
-
-```nix
-"my-hydra-app"
-```
+` "my-hydra-app" `
 
 
 <!--end generated NixOS module documentation-->

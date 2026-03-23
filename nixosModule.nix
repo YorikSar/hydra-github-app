@@ -33,6 +33,10 @@ let
     "GITHUB_APP_PRIVATE_KEY_PATH" = "%d/github_app_private_key";
     "HYDRA_PASSWORD_PATH" = "%d/hydra_password";
   };
+
+  # This type has been moved from pkgs-lib to lib in https://github.com/NixOS/nixpkgs/pull/470842
+  # But it's still in pkgs-lib in 25.11
+  json = lib.types.json or (pkgs.formats.json { }).type;
 in
 {
   options.services.hydra-github-app = {
@@ -119,7 +123,7 @@ in
                           * `pr_number` containing the number of the PR that triggered the jobset.
                       * `flake` field if present can match `{pr head}`, `{pr base}` or `{pr merge}` to be replaced with the appropriate flake URI (see above)
                     '';
-                    type = lib.types.json;
+                    type = json;
                   };
                 };
               }
