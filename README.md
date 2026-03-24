@@ -43,8 +43,10 @@ To create and install GitHub app:
         * keep *Active* checked 
         * fill the URL that will point to the app's server
         * write any text in *Secret* field and save it securely to put in the config
-    * in *Permissions* under *Repository permissions* for *Checks* select *Read and write*
-        * it means that the key for this app can create any checks for any commit in the repo
+    * in *Permissions* under *Repository permissions* select:
+        * for *Checks* select *Read and write* - it means that the key for this app can create any checks for any commit in the repo
+        * for *Pull requests* select *Read only* - it means that the key for this app can read any pull requests in the repo
+    * in *Subscribe to events* select *Pull request* - these events will actually trigger jobsets
     * under *Where can this GitHub App be installed?* select the appropriate option
 1. press *Create GitHub App*
 1. on the configuration screen for the new app:
