@@ -310,6 +310,12 @@ mod github {
     }
 
     #[derive(serde::Deserialize, Debug)]
+    pub struct CheckSuiteEvent {
+        pub installation: SimpleInstallation,
+        pub repository: Repository,
+    }
+
+    #[derive(serde::Deserialize, Debug)]
     pub struct App {
         id: u64,
     }
@@ -373,6 +379,7 @@ mod github {
         Installation(InstallationEvent),
         InstallationRepositories(InstallationRepositoriesEvent),
         PullRequest(PullRequestEvent),
+        CheckSuite(CheckSuiteEvent),
     }
 
     use tokio::sync::{mpsc, oneshot};
@@ -591,7 +598,7 @@ mod github {
 
         pub async fn patch_check_suites_preferences(
             &self,
-            repo_full_name: String,
+            repo_full_name: &str,
             app_id: u64,
             setting: bool,
         ) -> Result<()> {
@@ -1796,13 +1803,49 @@ mod webhook {
                             eprintln!("configuring check suite preferences for {}", r.full_name);
                             let _ = installation_client
                                 .patch_check_suites_preferences(
-                                    r.full_name,
+                                    &r.full_name,
                                     event.installation.app_id,
                                     false,
                                 )
                                 .await
                                 .inspect_err(|err| eprintln!("{err}"));
                         });
+                    }
+                }
+            }
+            Payload::CheckSuite(event) => {
+                match async {
+                    let installation_client = github_client
+                        .for_installation(event.installation.id)
+                        .await?;
+                    eprintln!(
+                        "disabling check_suite events for {}",
+                        event.repository.full_name
+                    );
+                    installation_client
+                        .patch_check_suites_preferences(&event.repository.full_name, app_id, false)
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    Ok(()) => {
+                        return Ok(warp::reply::with_status(
+                            format!(
+                                "disabled check_suite events for {}",
+                                event.repository.full_name
+                            ),
+                            warp::http::StatusCode::OK,
+                        ));
+                    }
+                    Err(err) => {
+                        return Ok(warp::reply::with_status(
+                            format!(
+                                "failed to disable check_suite events for {}: {err:?}",
+                                event.repository.full_name
+                            ),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
                     }
                 }
             }
@@ -1876,7 +1919,7 @@ mod webhook {
             }
         };
         Ok(warp::reply::with_status(
-            "",
+            "".to_string(),
             warp::http::StatusCode::NO_CONTENT,
         ))
     }
@@ -1902,6 +1945,7 @@ mod webhook {
                 serde_json::from_slice(&body).map(Payload::InstallationRepositories)
             }
             "pull_request" => serde_json::from_slice(&body).map(Payload::PullRequest),
+            "check_suite" => serde_json::from_slice(&body).map(Payload::CheckSuite),
             // TODO: also handle check_run event so that user can click "re-run"
             _ => {
                 //log_body(&body);
