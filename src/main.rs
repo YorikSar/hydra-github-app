@@ -11,7 +11,7 @@ enum SecretFromFileOrEnv {
 impl SecretFromFileOrEnv {
     fn get(self) -> Result<Vec<u8>> {
         fn trim_last_newline(mut v: Vec<u8>) -> Vec<u8> {
-            v.pop_if(|b| *b == '\n' as u8);
+            v.pop_if(|b| *b == b'\n');
             v
         }
 
@@ -1494,11 +1494,12 @@ mod webhook {
             .and_then({
                 let secret = std::sync::Arc::new(secret);
                 move |sig, body| {
-                    (async |secret: std::sync::Arc<Vec<u8>>, sig, body| {
-                        github::check_signature(&secret.clone(), sig, body)
+                    let secret = secret.clone();
+                    async move {
+                        github::check_signature(&secret, sig, body)
                             .map_err(Error::reject_internal)
                             .await
-                    })(secret.clone(), sig, body)
+                    }
                 }
             })
     }
