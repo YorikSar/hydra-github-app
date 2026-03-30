@@ -407,8 +407,7 @@ mod github {
             tokio::spawn(async move {
                 let mut token_store: Option<(String, chrono::DateTime<_>)> = None;
                 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-                let jwt_header =
-                    URL_SAFE_NO_PAD.encode("{\"typ\":\"JWT\",\"alg\":\"RS256\"}") + ".";
+                let jwt_header = URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"RS256"}"#) + ".";
                 let signer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key);
                 const TOKEN_VALIDITY_BEFORE: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
                 const TOKEN_VALIDITY: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
