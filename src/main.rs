@@ -328,6 +328,7 @@ mod github {
         name: String,
         app: Option<App>,
         details_url: String,
+        external_id: String,
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone)]
@@ -355,11 +356,12 @@ mod github {
         TimedOut,
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     pub struct UpsertCheckRunData {
         #[serde(flatten)]
         pub status: CheckRunStatus,
         pub details_url: String,
+        pub external_id: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -897,7 +899,12 @@ mod github {
                     "found check run \"{check_run_name}\" for commit {sha} with id {}",
                     check_run.id
                 );
-                if check_run.status == data.status && check_run.details_url == data.details_url {
+                if (UpsertCheckRunData {
+                    status: check_run.status,
+                    details_url: check_run.details_url,
+                    external_id: check_run.external_id,
+                }) == *data
+                {
                     eprintln!(
                         "check run \"{check_run_name}\" for commit {sha} is already in the expected state"
                     );
@@ -1535,23 +1542,24 @@ mod webhook {
         // TODO: keep a task per jobset in memory instead of looping
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let _ =
-                async {
-                    let project = hydra_client
-                        .get_project(&hydra_project)
-                        .await
-                        .with_context(|| {
-                            format!("failed to get information about project {}", hydra_project)
-                        })?;
-                    //eprintln!("got project {}: {project:?}", hydra_project);
-                    for jobset_name in project.jobsets {
-                        let _ = async {
+            let _ = async {
+                let project = hydra_client
+                    .get_project(&hydra_project)
+                    .await
+                    .with_context(|| {
+                        format!("failed to get information about project {}", hydra_project)
+                    })?;
+                //eprintln!("got project {}: {project:?}", hydra_project);
+                for jobset_name in project.jobsets {
+                    let _ = async {
                         let (_pr_number, commit_sha) = match crate::parse_jobset_name(&jobset_name)
                         {
                             Some(x) => x,
                             None => return Ok::<(), anyhow::Error>(()),
                         };
-                        let jobset = hydra_client.get_jobset(&hydra_project, &jobset_name).await?;
+                        let jobset = hydra_client
+                            .get_jobset(&hydra_project, &jobset_name)
+                            .await?;
                         if matches!(jobset.enabled, hydra::JobsetEnabled::Disabled)
                             || !jobset.visible
                         {
@@ -1597,7 +1605,7 @@ mod webhook {
 
                         let installation_client = github_client.for_repo(repository_name).await?;
 
-                        let (status, details_url, builds) = 'data: {
+                        let (external_id, status, details_url, builds) = 'data: {
                             use github::CheckRunConclusion::*;
                             use github::CheckRunStatus::*;
 
@@ -1607,11 +1615,11 @@ mod webhook {
                                 && jobset.errormsg.as_ref().is_some_and(|m| !m.is_empty())
                             {
                                 eprintln!("jobset {jobset_name} failed to evaluate");
-                                break 'data (Completed(Failure), details_url, None);
+                                break 'data (&jobset_name, Completed(Failure), details_url, None);
                             }
                             if jobset.triggertime.is_some() || jobset.starttime.is_some() {
                                 eprintln!("jobset {jobset_name} is being evaluated");
-                                break 'data (Queued, details_url, None);
+                                break 'data (&jobset_name, Queued, details_url, None);
                             }
                             let evals = hydra_client
                                 .get_jobset_evals(&hydra_project, &jobset_name)
@@ -1622,7 +1630,12 @@ mod webhook {
                                 Some(eval) => eval,
                                 None => {
                                     eprintln!("jobset {jobset_name} has no evals");
-                                    break 'data (Completed(Skipped), details_url, None);
+                                    break 'data (
+                                        &jobset_name,
+                                        Completed(Skipped),
+                                        details_url,
+                                        None,
+                                    );
                                 }
                             };
                             eprintln!(
@@ -1652,6 +1665,7 @@ mod webhook {
                             );
 
                             (
+                                &format!("{jobset_name}:{}", last_eval.id),
                                 if !all_finished {
                                     InProgress
                                 } else {
@@ -1670,6 +1684,7 @@ mod webhook {
                             &commit_sha,
                             &github::UpsertCheckRunData {
                                 status: status.clone(),
+                                external_id: external_id.to_owned(),
                                 details_url,
                             },
                         )
@@ -1697,6 +1712,7 @@ mod webhook {
                                             // TODO: more granular conclusions?
                                             (true, _) => Completed(Failure),
                                         },
+                                        external_id: format!("{external_id}:{}", build.id),
                                         details_url: hydra_client.build_url(build.id),
                                     },
                                 )
@@ -1723,11 +1739,11 @@ mod webhook {
                     .await
                     .with_context(|| format!("failed to process jobset {jobset_name}"))
                     .inspect_err(|err| eprintln!("{err:?}"));
-                    }
-                    Ok::<(), anyhow::Error>(())
                 }
-                .await
-                .inspect_err(|err| eprintln!("{err:?}"));
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+            .inspect_err(|err| eprintln!("{err:?}"));
         }
     }
 
@@ -1913,6 +1929,7 @@ mod webhook {
                     &github::UpsertCheckRunData {
                         status: github::CheckRunStatus::Queued,
                         details_url: hydra_client.jobset_url(&hydra_project, &jobset_id),
+                        external_id: jobset_id,
                     },
                 )
                 .await
