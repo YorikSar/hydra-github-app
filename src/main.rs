@@ -1604,21 +1604,25 @@ mod webhook {
 
                         let installation_client = github_client.for_repo(repository_name).await?;
 
-                        let (external_id, status, details_url, builds) = 'data: {
+                        let eval_check_data = 'data: {
                             use github::CheckRunConclusion::*;
                             use github::CheckRunStatus::*;
 
-                            let details_url = hydra_client.jobset_url(&hydra_project, &jobset_name);
-
+                            let mut data = github::UpsertCheckRunData {
+                                status: Queued,
+                                details_url: hydra_client.jobset_url(&hydra_project, &jobset_name),
+                                external_id: jobset_name.clone(),
+                            };
                             if jobset.errortime.is_some()
                                 && jobset.errormsg.as_ref().is_some_and(|m| !m.is_empty())
                             {
                                 eprintln!("jobset {jobset_name} failed to evaluate");
-                                break 'data (&jobset_name, Completed(Failure), details_url, None);
+                                data.status = Completed(Failure);
+                                break 'data data;
                             }
                             if jobset.triggertime.is_some() || jobset.starttime.is_some() {
                                 eprintln!("jobset {jobset_name} is being evaluated");
-                                break 'data (&jobset_name, Queued, details_url, None);
+                                break 'data data;
                             }
                             let evals = hydra_client
                                 .get_jobset_evals(&hydra_project, &jobset_name)
@@ -1629,12 +1633,8 @@ mod webhook {
                                 Some(eval) => eval,
                                 None => {
                                     eprintln!("jobset {jobset_name} has no evals");
-                                    break 'data (
-                                        &jobset_name,
-                                        Completed(Skipped),
-                                        details_url,
-                                        None,
-                                    );
+                                    data.status = Completed(Skipped);
+                                    break 'data data;
                                 }
                             };
                             eprintln!(
@@ -1642,37 +1642,58 @@ mod webhook {
                                 evals.len(),
                                 last_eval.id
                             );
-                            let details_url = hydra_client.eval_url(last_eval.id);
+                            data.details_url = hydra_client.eval_url(last_eval.id);
+                            data.external_id = format!("{jobset_name}:{}", last_eval.id);
 
-                            let builds = hydra_client
+                            let mut all_finished = true;
+                            let mut has_failures = false;
+
+                            for build in hydra_client
                                 .get_eval_builds(last_eval.id)
                                 .await
-                                .context("failed to get builds")?;
-
-                            let (all_finished, has_failures) = builds.iter().fold(
-                                (true, false),
-                                |(all_finished, has_failures), build| match (
-                                    build.finished,
-                                    &build.buildstatus,
-                                ) {
-                                    (false, _) => (false, has_failures),
-                                    (true, Some(hydra::BuildStatus::Succeeded)) => {
-                                        (all_finished, has_failures)
+                                .context("failed to get builds")?
+                            {
+                                let status = match (build.finished, &build.buildstatus) {
+                                    (false, _) => {
+                                        all_finished = false;
+                                        InProgress
                                     }
-                                    (true, _) => (all_finished, true),
-                                },
-                            );
+                                    (true, Some(hydra::BuildStatus::Succeeded)) => {
+                                        Completed(Success)
+                                    }
+                                    (true, _) => {
+                                        has_failures = true;
+                                        // TODO: more granular conclusions?
+                                        Completed(Failure)
+                                    }
+                                };
+                                if repo_config.check_per_job {
+                                    github::upsert_check(
+                                        &installation_client,
+                                        app_id,
+                                        &build.job,
+                                        repository_name,
+                                        &commit_sha,
+                                        &github::UpsertCheckRunData {
+                                            status,
+                                            external_id: format!(
+                                                "{}:{}",
+                                                data.external_id, build.id
+                                            ),
+                                            details_url: hydra_client.build_url(build.id),
+                                        },
+                                    )
+                                    .await?;
+                                    // TODO: don't fail on first error to upsert a check
+                                }
+                            }
 
-                            (
-                                &format!("{jobset_name}:{}", last_eval.id),
-                                if !all_finished {
-                                    InProgress
-                                } else {
-                                    Completed(if has_failures { Failure } else { Success })
-                                },
-                                details_url,
-                                Some(builds),
-                            )
+                            data.status = if !all_finished {
+                                InProgress
+                            } else {
+                                Completed(if has_failures { Failure } else { Success })
+                            };
+                            data
                         };
 
                         github::upsert_check(
@@ -1681,45 +1702,11 @@ mod webhook {
                             &repo_config.check_run_name,
                             repository_name,
                             &commit_sha,
-                            &github::UpsertCheckRunData {
-                                status: status.clone(),
-                                external_id: external_id.to_owned(),
-                                details_url,
-                            },
+                            &eval_check_data,
                         )
                         .await?;
 
-                        if let Some(builds) = builds
-                            && repo_config.check_per_job
-                        {
-                            use github::CheckRunConclusion::*;
-                            use github::CheckRunStatus::*;
-
-                            for build in builds {
-                                github::upsert_check(
-                                    &installation_client,
-                                    app_id,
-                                    &build.job,
-                                    repository_name,
-                                    &commit_sha,
-                                    &github::UpsertCheckRunData {
-                                        status: match (build.finished, &build.buildstatus) {
-                                            (false, _) => InProgress,
-                                            (true, Some(hydra::BuildStatus::Succeeded)) => {
-                                                Completed(Success)
-                                            }
-                                            // TODO: more granular conclusions?
-                                            (true, _) => Completed(Failure),
-                                        },
-                                        external_id: format!("{external_id}:{}", build.id),
-                                        details_url: hydra_client.build_url(build.id),
-                                    },
-                                )
-                                .await?;
-                            }
-                        }
-
-                        if matches!(status, github::CheckRunStatus::Completed(_)) {
+                        if matches!(eval_check_data.status, github::CheckRunStatus::Completed(_)) {
                             eprintln!("disabling jobset {jobset_name}");
                             hydra_client
                                 .put_jobset(
