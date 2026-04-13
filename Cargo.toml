@@ -13,7 +13,7 @@ futures-util = "0.3.31"
 hex = "0.4.3"
 hmac = "0.12.1"
 jwt = "0.16.0"
-reqwest = { version = "0.13.1", features = ["cookies", "gzip", "json", "query"] }
+reqwest = { version = "0.13.1", features = ["cookies", "gzip", "json", "query", "stream"] }
 rsa = { version = "0.9.9", features = ["sha2"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

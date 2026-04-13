@@ -166,6 +166,7 @@ async fn do_one_pr(cfg: Config, pull_request_url: String) -> Result<()> {
 }
 
 mod github {
+    use crate::ResponseErrorWithBody;
     use anyhow::{Context, Result, anyhow};
 
     // Signature verification
@@ -476,7 +477,8 @@ mod github {
                 .with_context(|| {
                     format!("failed to send an installation token request for {installation_id}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| {
                     format!("installation token request for {installation_id} failed")
                 })?
@@ -508,7 +510,8 @@ mod github {
                 .with_context(|| {
                     format!("failed to send an installation request for {repo_full_name}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("installation request for {repo_full_name} failed"))?
                 .json::<Response>()
                 .await
@@ -551,7 +554,8 @@ mod github {
                 .send()
                 .await
                 .with_context(|| format!("failed to send request for pull request {pr_number}"))?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request for pull request {pr_number} failed"))?
                 .json::<PullRequest>()
                 .await
@@ -571,7 +575,8 @@ mod github {
                 .send()
                 .await
                 .with_context(|| format!("failed to send request for commit {commit_sha}"))?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request for commit {commit_sha} failed"))?
                 .json::<GitCommit>()
                 .await
@@ -623,7 +628,7 @@ mod github {
                 .send()
                 .await
                 .with_context(|| format!("failed to send request to update check suite preferences for {repo_full_name}"))?
-                .error_for_status()
+                .error_for_status_with_body().await
                 .with_context(|| format!("request to update check suite preferences for {repo_full_name} failed"))?;
             eprintln!("updated check suite preferences for {repo_full_name}");
             Ok(())
@@ -653,7 +658,8 @@ mod github {
                 .with_context(|| {
                     format!("failed to send request for check runs for commit {commit_sha}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request for check runs for commit {commit_sha} failed"))?
                 .json::<Response>()
                 .await
@@ -691,7 +697,8 @@ mod github {
                 .with_context(|| {
                     format!("failed to send request to create a check run for commit {head_sha}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| {
                     format!("request to create a check run for commit {head_sha} failed")
                 })?;
@@ -729,7 +736,8 @@ mod github {
                 .with_context(|| {
                     format!("failed to send request to patch a check run for commit {head_sha}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| {
                     format!("request to patch a check run for commit {head_sha} failed")
                 })?;
@@ -984,6 +992,7 @@ mod github {
 }
 
 mod hydra {
+    use crate::ResponseErrorWithBody;
     use anyhow::{Context, Result};
 
     #[derive(serde_repr::Serialize_repr, serde_repr::Deserialize_repr, Debug, Default, Clone)]
@@ -1203,7 +1212,8 @@ mod hydra {
                 }))
                 .send()
                 .await?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .context("couldn't login to Hydra")?;
             Ok(Client {
                 http_client,
@@ -1232,7 +1242,8 @@ mod hydra {
                         "failed to send put request for jobset {jobset_id} in project {project}"
                     )
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| {
                     format!("put request for jobset {jobset_id} in project {project} failed")
                 })?;
@@ -1256,7 +1267,8 @@ mod hydra {
                 .with_context(|| {
                     format!("failed to send request to trigger jobset {project_jobset}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request to trigger jobset {project_jobset} failed"))?
                 .json::<Response>()
                 .await
@@ -1271,7 +1283,8 @@ mod hydra {
                 .send()
                 .await
                 .with_context(|| format!("failed to send request to get project {project}"))?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request to get project {project} failed"))?
                 .json::<Project>()
                 .await
@@ -1292,7 +1305,8 @@ mod hydra {
                 .with_context(|| {
                     format!("failed to send request to get jobset {project}:{jobset}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request to get jobset {project}:{jobset} failed"))?
                 .json::<Jobset>()
                 .await
@@ -1321,7 +1335,8 @@ mod hydra {
                 .with_context(|| {
                     format!("failed to send request to get evals for jobset {project}:{jobset}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| {
                     format!("request to get evals for jobset {project}:{jobset} failed")
                 })?
@@ -1340,7 +1355,8 @@ mod hydra {
                 .with_context(|| {
                     format!("failed to send request to get builds for eval {eval_id}")
                 })?
-                .error_for_status()
+                .error_for_status_with_body()
+                .await
                 .with_context(|| format!("request to get builds for eval {eval_id} failed"))?
                 .json()
                 .await
@@ -2071,5 +2087,41 @@ mod webhook {
             }));
         warp::serve(route).run(listen_address).await;
         Ok(())
+    }
+}
+
+// Convenience method to log response body along with the error
+trait ResponseErrorWithBody {
+    async fn error_for_status_with_body(self) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+impl ResponseErrorWithBody for reqwest::Response {
+    async fn error_for_status_with_body(self) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let Err(http_err) = self.error_for_status_ref() else {
+            return Ok(self);
+        };
+        use futures_util::StreamExt;
+        match self.bytes_stream().next().await {
+            None => Err(anyhow!("got empty body").context(http_err)),
+            Some(Err(body_err)) => Err(anyhow!(body_err)
+                .context("couldn't read the body")
+                .context(http_err)),
+            Some(Ok(chunk)) => {
+                // Only take up to first kb
+                let body = String::from_utf8_lossy(if chunk.len() > 1024 {
+                    &chunk[..1024]
+                } else {
+                    &chunk
+                });
+                // In case we cut through a UTF8 chunk, ignore it
+                let body_trimmed = body.trim_end_matches('\u{FFFD}');
+                Err(anyhow!("got response body: {}", body_trimmed).context(http_err))
+            }
+        }
     }
 }
