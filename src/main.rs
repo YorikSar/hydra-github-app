@@ -330,6 +330,8 @@ mod github {
         app: Option<App>,
         details_url: String,
         external_id: String,
+        #[serde(deserialize_with = "deserialize_check_run_output")]
+        output: Option<CheckRunOutput>,
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone)]
@@ -357,12 +359,79 @@ mod github {
         TimedOut,
     }
 
+    // This struct is different in different places of API:
+    // - in GET, title and summary are nullable and everything is required
+    // - in POST, title and summary are required and nothing is nullable
+    // - in PATCH, only summary is required in the spec, but in fact title is also required, nothing is nullable
+    // We model it with Option<CheckRunOutput> that will check if title and summary are null
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Default)]
+    pub struct CheckRunOutput {
+        pub title: String,
+        pub summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+    }
+
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     pub struct UpsertCheckRunData {
         #[serde(flatten)]
         pub status: CheckRunStatus,
         pub details_url: String,
         pub external_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "deserialize_check_run_output")]
+        pub output: Option<CheckRunOutput>,
+    }
+
+    pub fn deserialize_check_run_output<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<CheckRunOutput>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct NullableCheckRunOutput {
+            pub title: Option<String>,
+            pub summary: Option<String>,
+            pub text: Option<String>,
+        }
+        match serde::Deserialize::deserialize(deserializer)? {
+            NullableCheckRunOutput {
+                title: Some(title),
+                summary: Some(summary),
+                text,
+            } => Ok(Some(CheckRunOutput {
+                title,
+                summary,
+                text,
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_check_run_output() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct TestStruct {
+            #[serde(deserialize_with = "deserialize_check_run_output")]
+            pub output: Option<CheckRunOutput>,
+        }
+        assert!(matches!(
+            serde_json::from_value(serde_json::json!({"output": {"title": null, "summary": null}})),
+            Ok(TestStruct { output: None })
+        ));
+        assert!(matches!(
+            serde_json::from_value(
+                serde_json::json!({"output": {"title": "title", "summary": "summary"}})
+            ),
+            Ok(TestStruct {
+                output: Some(CheckRunOutput {
+                    title,
+                    summary,
+                    text: None,
+                })
+            }) if title == "title" && summary == "summary"
+        ));
     }
 
     #[derive(serde::Deserialize)]
@@ -910,6 +979,7 @@ mod github {
                     status: check_run.status,
                     details_url: check_run.details_url,
                     external_id: check_run.external_id,
+                    output: check_run.output,
                 }) == *data
                 {
                     eprintln!(
@@ -1143,6 +1213,7 @@ mod hydra {
         pub finished: bool,
         pub buildstatus: Option<BuildStatus>,
         pub job: String,
+        pub drvpath: String,
     }
 
     fn bool_from_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -1365,6 +1436,43 @@ mod hydra {
 
         pub(crate) fn build_url(&self, build_id: u64) -> String {
             format!("{}/build/{build_id}", self.base_url)
+        }
+
+        pub async fn get_log(&self, drvpath: &str, tail: Option<u64>) -> Result<Option<String>> {
+            let drvname = std::path::Path::new(drvpath)
+                .file_name()
+                .with_context(|| format!("couldn't get file name form drv path {drvpath:?}"))?
+                .to_string_lossy();
+            let req = self
+                .http_client
+                .get(format!("{}/log/{drvname}", self.base_url))
+                .header(reqwest::header::ACCEPT, "application/json");
+            let resp = match tail {
+                Some(tail) => req.query(&[("tail", tail)]),
+                None => req,
+            }
+            .send()
+            .await
+            .with_context(|| format!("failed to send request to get logs for drv {drvpath:?}"))?
+            .error_for_status_with_body()
+            .await;
+            match resp {
+                Ok(resp) => {
+                    Ok(Some(resp.text().await.with_context(|| {
+                        format!("failed to read logs for drv {drvpath:?}")
+                    })?))
+                }
+                Err(aerr) => {
+                    if aerr.downcast_ref::<reqwest::Error>().is_some_and(|rerr| {
+                        matches!(rerr.status(), Some(reqwest::StatusCode::NOT_FOUND))
+                    }) {
+                        Ok(None)
+                    } else {
+                        Err(aerr)
+                    }
+                }
+            }
+            .with_context(|| format!("request to get logs for drv {drvpath:?} failed"))
         }
     }
 }
@@ -1628,16 +1736,28 @@ mod webhook {
                                 status: Queued,
                                 details_url: hydra_client.jobset_url(&hydra_project, &jobset_name),
                                 external_id: jobset_name.clone(),
+                                output: None,
                             };
                             if jobset.errortime.is_some()
-                                && jobset.errormsg.as_ref().is_some_and(|m| !m.is_empty())
+                                && let Some(msg) = jobset.errormsg.as_ref()
+                                && !msg.is_empty()
                             {
                                 eprintln!("jobset {jobset_name} failed to evaluate");
                                 data.status = Completed(Failure);
+                                data.output = Some(github::CheckRunOutput {
+                                    title: "failed to evaluate".to_owned(),
+                                    // 65535 - 2*3 for tripple quotes - 2 for newlines
+                                    summary: format!("```\n{msg:.65527}\n```"),
+                                    text: None,
+                                });
                                 break 'data data;
                             }
                             if jobset.triggertime.is_some() || jobset.starttime.is_some() {
                                 eprintln!("jobset {jobset_name} is being evaluated");
+                                data.output = Some(github::CheckRunOutput {
+                                    title: "evaluating...".to_owned(),
+                                    ..Default::default()
+                                });
                                 break 'data data;
                             }
                             let evals = hydra_client
@@ -1650,6 +1770,10 @@ mod webhook {
                                 None => {
                                     eprintln!("jobset {jobset_name} has no evals");
                                     data.status = Completed(Skipped);
+                                    data.output = Some(github::CheckRunOutput {
+                                        title: "jobset is empty".to_owned(),
+                                        ..Default::default()
+                                    });
                                     break 'data data;
                                 }
                             };
@@ -1684,6 +1808,8 @@ mod webhook {
                                     }
                                 };
                                 if repo_config.check_per_job {
+                                    let logs =
+                                        hydra_client.get_log(&build.drvpath, Some(50)).await?;
                                     github::upsert_check(
                                         &installation_client,
                                         app_id,
@@ -1691,12 +1817,35 @@ mod webhook {
                                         repository_name,
                                         &commit_sha,
                                         &github::UpsertCheckRunData {
-                                            status,
                                             external_id: format!(
                                                 "{}:{}",
                                                 data.external_id, build.id
                                             ),
                                             details_url: hydra_client.build_url(build.id),
+                                            output: Some(github::CheckRunOutput {
+                                                title: match status {
+                                                    InProgress => "In progress...",
+                                                    Completed(Success) => "Succeeded",
+                                                    Completed(Failure) => "Failed",
+                                                    _ => "Unknown", // Shouldn't get here, see status above
+                                                }
+                                                .to_owned(),
+                                                summary: match logs {
+                                                    Some(logs) => {
+                                                        if logs.is_empty() {
+                                                            "Build log is empty".to_owned()
+                                                        } else {
+                                                            // 65535 - 2*3 for tripple quotes - 2 for newlines
+                                                            format!("```\n{logs:.65527}\n```")
+                                                        }
+                                                    }
+                                                    None => {
+                                                        "Build logs are not available".to_owned()
+                                                    }
+                                                },
+                                                ..Default::default()
+                                            }),
+                                            status,
                                         },
                                     )
                                     .await?;
@@ -1720,7 +1869,8 @@ mod webhook {
                             &commit_sha,
                             &eval_check_data,
                         )
-                        .await?;
+                        .await
+                        .context("failed to upsert eval check")?;
 
                         if matches!(eval_check_data.status, github::CheckRunStatus::Completed(_)) {
                             eprintln!("disabling jobset {jobset_name}");
@@ -1932,6 +2082,7 @@ mod webhook {
                         status: github::CheckRunStatus::Queued,
                         details_url: hydra_client.jobset_url(&hydra_project, &jobset_id),
                         external_id: jobset_id,
+                        output: None,
                     },
                 )
                 .await
