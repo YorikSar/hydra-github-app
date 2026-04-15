@@ -291,6 +291,7 @@ mod github {
     #[derive(serde::Deserialize, Debug)]
     pub struct PullRequest {
         pub head: PullRequestBase,
+        pub base: PullRequestBase,
         pub number: u64,
         pub html_url: String,
         pub merge_commit_sha: Option<String>,
@@ -300,6 +301,7 @@ mod github {
     #[derive(serde::Deserialize, Debug)]
     pub struct PullRequestBase {
         pub sha: String,
+        pub r#ref: String,
     }
 
     #[derive(serde::Deserialize, Debug)]
@@ -1546,6 +1548,10 @@ async fn create_jobset_for_pr(
                     "pr head" => {
                         input.r#type = "git".to_string();
                         input.value = format!("{clone_url} {}", pull_request.head.sha);
+                    }
+                    "pr target branch" => {
+                        input.r#type = "string".to_string();
+                        input.value = pull_request.base.r#ref.clone();
                     }
                     _ => {}
                 };
