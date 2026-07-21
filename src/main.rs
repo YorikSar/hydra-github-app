@@ -55,6 +55,8 @@ struct RepoConfig {
     pub hydra_jobset_template: hydra::Jobset,
     #[serde(default)]
     pub check_per_job: bool,
+    #[serde(default)]
+    pub cancel_obsolete_builds: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -289,6 +291,13 @@ mod github {
     }
 
     #[derive(serde::Deserialize, Debug)]
+    #[serde(rename_all = "camelCase")]
+    pub enum PullRequestState {
+        Open,
+        Closed,
+    }
+
+    #[derive(serde::Deserialize, Debug)]
     pub struct PullRequest {
         pub head: PullRequestBase,
         pub base: PullRequestBase,
@@ -296,6 +305,7 @@ mod github {
         pub html_url: String,
         pub merge_commit_sha: Option<String>,
         pub mergeable: Option<bool>,
+        pub(crate) state: PullRequestState,
     }
 
     #[derive(serde::Deserialize, Debug)]
@@ -1265,7 +1275,11 @@ mod hydra {
                 //.connection_verbose(true)
                 //.http1_only()
                 .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.url().path() == "/current-user" {
+                    // /login redirects to /current-user on success
+                    if attempt.url().path() == "/current-user"
+                    // /eval/ID/cancel redirects to /eval/ID on success
+                    || attempt.url().path().starts_with("/eval")
+                    {
                         attempt.stop()
                     } else {
                         reqwest::redirect::Policy::default().redirect(attempt)
@@ -1298,7 +1312,7 @@ mod hydra {
             &self,
             project: &str,
             jobset_id: &str,
-            jobset: Jobset,
+            jobset: &Jobset,
         ) -> Result<()> {
             let _ = self
                 .http_client
@@ -1417,6 +1431,18 @@ mod hydra {
                 .await
                 .context("failed to parse JSON")
                 .map(|res| res.evals)
+        }
+
+        pub async fn cancel_eval(&self, eval_id: u64) -> Result<()> {
+            self.http_client
+                .put(format!("{}/eval/{eval_id}/cancel", self.base_url))
+                .send()
+                .await
+                .with_context(|| format!("failed to send request to cancel eval {eval_id}"))?
+                .error_for_status_with_body()
+                .await
+                .with_context(|| format!("request to cancel eval {eval_id} failed"))?;
+            Ok(())
         }
 
         pub async fn get_eval_builds(&self, eval_id: u64) -> Result<Vec<Build>> {
@@ -1577,7 +1603,7 @@ async fn create_jobset_for_pr(
         },
     }
     hydra_client
-        .put_jobset(hydra_project, &jobset_id, jobset)
+        .put_jobset(hydra_project, &jobset_id, &jobset)
         .await?;
     let project_jobset = format!("{}:{}", hydra_project, jobset_id);
     let jobsets_triggered = hydra_client.trigger_jobset(&project_jobset).await?;
@@ -1668,10 +1694,13 @@ mod webhook {
         app_id: u64,
         repositories_cfg: std::sync::Arc<std::collections::HashMap<String, crate::RepoConfig>>,
     ) {
+        let mut last_pr_commit_cache =
+            std::collections::HashMap::<(String, u64), (bool, String)>::new();
         // TODO: keep a task per jobset in memory instead of looping
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let _ = async {
+                last_pr_commit_cache.clear();
                 let project = hydra_client
                     .get_project(&hydra_project)
                     .await
@@ -1681,8 +1710,7 @@ mod webhook {
                 //eprintln!("got project {}: {project:?}", hydra_project);
                 for jobset_name in project.jobsets {
                     let _ = async {
-                        let (_pr_number, commit_sha) = match crate::parse_jobset_name(&jobset_name)
-                        {
+                        let (pr_number, commit_sha) = match crate::parse_jobset_name(&jobset_name) {
                             Some(x) => x,
                             None => return Ok::<(), anyhow::Error>(()),
                         };
@@ -1878,19 +1906,59 @@ mod webhook {
                         .await
                         .context("failed to upsert eval check")?;
 
+                        // Clone the name if we need it later
+                        let repository_name = if repo_config.cancel_obsolete_builds {
+                            repository_name.clone()
+                        } else {
+                            Default::default()
+                        };
+
                         if matches!(eval_check_data.status, github::CheckRunStatus::Completed(_)) {
                             eprintln!("disabling jobset {jobset_name}");
                             hydra_client
                                 .put_jobset(
                                     &hydra_project,
                                     &jobset_name,
-                                    hydra::Jobset {
+                                    &hydra::Jobset {
                                         enabled: hydra::JobsetEnabled::Disabled,
                                         visible: false,
                                         ..jobset
                                     },
                                 )
                                 .await?;
+                        }
+
+                        if repo_config.cancel_obsolete_builds {
+                            use std::collections::hash_map::Entry;
+                            let entry =
+                                last_pr_commit_cache.entry((repository_name.clone(), pr_number));
+                            let (pr_open, last_pr_commit) = match entry {
+                                Entry::Occupied(e) => e.get().clone(),
+                                Entry::Vacant(e) => {
+                                    let pr = installation_client
+                                        .get_client()
+                                        .get_pull_request(&repository_name, pr_number)
+                                        .await?;
+                                    let commit_sha = pr.head.sha;
+                                    let res = (
+                                        matches!(pr.state, github::PullRequestState::Open),
+                                        commit_sha.clone(),
+                                    );
+                                    e.insert(res.clone());
+                                    res
+                                }
+                            };
+                            if !pr_open || *last_pr_commit != commit_sha {
+                                eprintln!("cancelling evals for jobset {jobset_name}");
+                                let evals = hydra_client
+                                    .get_jobset_evals(&hydra_project, &jobset_name)
+                                    .await
+                                    .context("failed to get evals to cancel")?;
+                                for eval in evals {
+                                    eprintln!("cancelling eval {}", eval.id);
+                                    hydra_client.cancel_eval(eval.id).await?;
+                                }
+                            }
                         }
                         Ok(())
                     }
