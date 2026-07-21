@@ -1676,6 +1676,143 @@ mod webhook {
         assert_eq!(response.status(), 200);
     }
 
+    async fn get_check_data_for_jobset(
+        hydra_client: &hydra::Client,
+        hydra_project: &str,
+        jobset_name: &str,
+        jobset: &hydra::Jobset,
+        check_run_name: &str,
+        check_per_job: bool,
+    ) -> Result<(
+        github::UpsertCheckRunData,
+        Option<Vec<github::UpsertCheckRunData>>,
+    )> {
+        use github::CheckRunConclusion::*;
+        use github::CheckRunStatus::*;
+
+        let mut data = github::UpsertCheckRunData {
+            name: check_run_name.to_owned(),
+            status: Queued,
+            details_url: hydra_client.jobset_url(hydra_project, jobset_name),
+            external_id: jobset_name.to_owned(),
+            output: None,
+        };
+        if jobset.errortime.is_some()
+            && let Some(msg) = jobset.errormsg.as_ref()
+            && !msg.is_empty()
+        {
+            eprintln!("jobset {jobset_name} failed to evaluate");
+            data.status = Completed(Failure);
+            data.output = Some(github::CheckRunOutput {
+                title: "failed to evaluate".to_owned(),
+                // 65535 - 2*3 for tripple quotes - 2 for newlines
+                summary: format!("```\n{msg:.65527}\n```"),
+                text: None,
+            });
+            return Ok((data, None));
+        }
+        if jobset.triggertime.is_some() || jobset.starttime.is_some() {
+            eprintln!("jobset {jobset_name} is being evaluated");
+            data.output = Some(github::CheckRunOutput {
+                title: "evaluating...".to_owned(),
+                ..Default::default()
+            });
+            return Ok((data, None));
+        }
+        let evals = hydra_client
+            .get_jobset_evals(hydra_project, jobset_name)
+            .await
+            .context("failed to get evals")?;
+
+        let last_eval = match evals.first() {
+            Some(eval) => eval,
+            None => {
+                eprintln!("jobset {jobset_name} has no evals");
+                data.status = Completed(Skipped);
+                data.output = Some(github::CheckRunOutput {
+                    title: "jobset is empty".to_owned(),
+                    ..Default::default()
+                });
+                return Ok((data, None));
+            }
+        };
+        eprintln!(
+            "got {} evals for jobset {jobset_name}, picking the first one, {}",
+            evals.len(),
+            last_eval.id
+        );
+        data.details_url = hydra_client.eval_url(last_eval.id);
+        data.external_id = format!("{jobset_name}:{}", last_eval.id);
+
+        let mut builds_check_data = Vec::new();
+
+        let mut all_finished = true;
+        let mut has_failures = false;
+
+        for build in hydra_client
+            .get_eval_builds(last_eval.id)
+            .await
+            .context("failed to get builds")?
+        {
+            let status = match (build.finished, &build.buildstatus) {
+                (false, _) => {
+                    all_finished = false;
+                    InProgress
+                }
+                (true, Some(hydra::BuildStatus::Succeeded)) => Completed(Success),
+                (true, _) => {
+                    has_failures = true;
+                    // TODO: more granular conclusions?
+                    Completed(Failure)
+                }
+            };
+            if check_per_job {
+                let logs = hydra_client.get_log(&build.drvpath, Some(50)).await?;
+                builds_check_data.push(github::UpsertCheckRunData {
+                    name: build.job,
+                    external_id: format!("{}:{}", data.external_id, build.id),
+                    details_url: hydra_client.build_url(build.id),
+                    output: Some(github::CheckRunOutput {
+                        title: match status {
+                            InProgress => "In progress...",
+                            Completed(Success) => "Succeeded",
+                            Completed(Failure) => "Failed",
+                            _ => "Unknown", // Shouldn't get here, see status above
+                        }
+                        .to_owned(),
+                        summary: match logs {
+                            Some(logs) => {
+                                if logs.is_empty() {
+                                    "Build log is empty".to_owned()
+                                } else {
+                                    // 65535 - 2*3 for tripple quotes - 2 for newlines
+                                    format!("```\n{logs:.65527}\n```")
+                                }
+                            }
+                            None => "Build logs are not available".to_owned(),
+                        },
+                        ..Default::default()
+                    }),
+                    status,
+                });
+            }
+        }
+
+        data.status = if !all_finished {
+            InProgress
+        } else {
+            Completed(if has_failures { Failure } else { Success })
+        };
+        Ok((
+            data,
+            if check_per_job {
+                Some(builds_check_data)
+            } else {
+                None
+            },
+        ))
+    }
+
     async fn sync_hydra_jobsets(
         hydra_client: hydra::Client,
         github_client: github::ApplicationClient,
@@ -1749,151 +1886,42 @@ mod webhook {
                             }
                         };
 
-                        let installation_client = github_client.for_repo(repository_name).await?;
+                        let (eval_check_data, builds_checks_data) = get_check_data_for_jobset(
+                            &hydra_client,
+                            &hydra_project,
+                            &jobset_name,
+                            &jobset,
+                            &repo_config.check_run_name,
+                            repo_config.check_per_job,
+                        )
+                        .await?;
 
-                        let eval_check_data = 'data: {
-                            use github::CheckRunConclusion::*;
-                            use github::CheckRunStatus::*;
+                        let eval_is_completed =
+                            matches!(eval_check_data.status, github::CheckRunStatus::Completed(_));
 
-                            let mut data = github::UpsertCheckRunData {
-                                name: repo_config.check_run_name.to_owned(),
-                                status: Queued,
-                                details_url: hydra_client.jobset_url(&hydra_project, &jobset_name),
-                                external_id: jobset_name.clone(),
-                                output: None,
-                            };
-                            if jobset.errortime.is_some()
-                                && let Some(msg) = jobset.errormsg.as_ref()
-                                && !msg.is_empty()
-                            {
-                                eprintln!("jobset {jobset_name} failed to evaluate");
-                                data.status = Completed(Failure);
-                                data.output = Some(github::CheckRunOutput {
-                                    title: "failed to evaluate".to_owned(),
-                                    // 65535 - 2*3 for tripple quotes - 2 for newlines
-                                    summary: format!("```\n{msg:.65527}\n```"),
-                                    text: None,
-                                });
-                                break 'data data;
-                            }
-                            if jobset.triggertime.is_some() || jobset.starttime.is_some() {
-                                eprintln!("jobset {jobset_name} is being evaluated");
-                                data.output = Some(github::CheckRunOutput {
-                                    title: "evaluating...".to_owned(),
-                                    ..Default::default()
-                                });
-                                break 'data data;
-                            }
-                            let evals = hydra_client
-                                .get_jobset_evals(&hydra_project, &jobset_name)
-                                .await
-                                .context("failed to get evals")?;
-
-                            let last_eval = match evals.first() {
-                                Some(eval) => eval,
-                                None => {
-                                    eprintln!("jobset {jobset_name} has no evals");
-                                    data.status = Completed(Skipped);
-                                    data.output = Some(github::CheckRunOutput {
-                                        title: "jobset is empty".to_owned(),
-                                        ..Default::default()
-                                    });
-                                    break 'data data;
-                                }
-                            };
-                            eprintln!(
-                                "got {} evals for jobset {jobset_name}, picking the first one, {}",
-                                evals.len(),
-                                last_eval.id
-                            );
-                            data.details_url = hydra_client.eval_url(last_eval.id);
-                            data.external_id = format!("{jobset_name}:{}", last_eval.id);
-
-                            let mut all_finished = true;
-                            let mut has_failures = false;
-
-                            for build in hydra_client
-                                .get_eval_builds(last_eval.id)
-                                .await
-                                .context("failed to get builds")?
-                            {
-                                let status = match (build.finished, &build.buildstatus) {
-                                    (false, _) => {
-                                        all_finished = false;
-                                        InProgress
-                                    }
-                                    (true, Some(hydra::BuildStatus::Succeeded)) => {
-                                        Completed(Success)
-                                    }
-                                    (true, _) => {
-                                        has_failures = true;
-                                        // TODO: more granular conclusions?
-                                        Completed(Failure)
-                                    }
-                                };
-                                if repo_config.check_per_job {
-                                    let logs =
-                                        hydra_client.get_log(&build.drvpath, Some(50)).await?;
-                                    github::upsert_check(
-                                        &installation_client,
-                                        app_id,
-                                        repository_name,
-                                        &commit_sha,
-                                        &github::UpsertCheckRunData {
-                                            name: build.job,
-                                            external_id: format!(
-                                                "{}:{}",
-                                                data.external_id, build.id
-                                            ),
-                                            details_url: hydra_client.build_url(build.id),
-                                            output: Some(github::CheckRunOutput {
-                                                title: match status {
-                                                    InProgress => "In progress...",
-                                                    Completed(Success) => "Succeeded",
-                                                    Completed(Failure) => "Failed",
-                                                    _ => "Unknown", // Shouldn't get here, see status above
-                                                }
-                                                .to_owned(),
-                                                summary: match logs {
-                                                    Some(logs) => {
-                                                        if logs.is_empty() {
-                                                            "Build log is empty".to_owned()
-                                                        } else {
-                                                            // 65535 - 2*3 for tripple quotes - 2 for newlines
-                                                            format!("```\n{logs:.65527}\n```")
-                                                        }
-                                                    }
-                                                    None => {
-                                                        "Build logs are not available".to_owned()
-                                                    }
-                                                },
-                                                ..Default::default()
-                                            }),
-                                            status,
-                                        },
-                                    )
-                                    .await?;
-                                    // TODO: don't fail on first error to upsert a check
-                                }
-                            }
-
-                            data.status = if !all_finished {
-                                InProgress
-                            } else {
-                                Completed(if has_failures { Failure } else { Success })
-                            };
-                            data
+                        let all_checks = if let Some(mut builds_checks_data) = builds_checks_data {
+                            builds_checks_data.push(eval_check_data);
+                            builds_checks_data
+                        } else {
+                            vec![eval_check_data]
                         };
 
-                        github::upsert_check(
-                            &installation_client,
-                            app_id,
-                            repository_name,
-                            &commit_sha,
-                            &eval_check_data,
-                        )
-                        .await
-                        .context("failed to upsert eval check")?;
+                        let installation_client = github_client.for_repo(repository_name).await?;
+
+                        for check_data in all_checks {
+                            github::upsert_check(
+                                &installation_client,
+                                app_id,
+                                repository_name,
+                                &commit_sha,
+                                &check_data,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("failed to upsert check {}", check_data.name)
+                            })?;
+                            // TODO: don't fail on first error to upsert a check
+                        }
 
                         // Clone the name if we need it later
                         let repository_name = if repo_config.cancel_obsolete_builds {
@@ -1902,7 +1930,7 @@ mod webhook {
                             Default::default()
                         };
 
-                        if matches!(eval_check_data.status, github::CheckRunStatus::Completed(_)) {
+                        if eval_is_completed {
                             eprintln!("disabling jobset {jobset_name}");
                             hydra_client
                                 .put_jobset(
