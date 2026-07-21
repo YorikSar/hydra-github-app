@@ -1813,6 +1813,152 @@ mod webhook {
         ))
     }
 
+    async fn sync_hydra_jobset(
+        hydra_client: &hydra::Client,
+        github_client: &github::ApplicationClient,
+        hydra_project: &str,
+        app_id: u64,
+        repositories_cfg: &std::collections::HashMap<String, crate::RepoConfig>,
+        last_pr_commit_cache: &mut std::collections::HashMap<(String, u64), (bool, String)>,
+        jobset_name: &str,
+    ) -> Result<()> {
+        let (pr_number, commit_sha) = match crate::parse_jobset_name(jobset_name) {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        let jobset = hydra_client.get_jobset(hydra_project, jobset_name).await?;
+        if matches!(jobset.enabled, hydra::JobsetEnabled::Disabled) || !jobset.visible {
+            return Ok(());
+        }
+        eprintln!("got jobset: {jobset_name}");
+
+        let repository_name = match jobset.definition {
+            hydra::JobsetDefinition::Legacy { ref inputs, .. } => {
+                &inputs
+                    .get("repository_name")
+                    .ok_or_else(|| anyhow!("repository_name input not found"))?
+                    .value
+            }
+            hydra::JobsetDefinition::Flake { ref flake } => {
+                // flake jobsets don't have inputs, so we have to parse repo name from the flake URI
+                let mut schema_split = flake.split(':');
+                if schema_split.next().is_none_or(|s| s != "github") {
+                    return Err(anyhow!("unexpected schema in flake URI {flake}"));
+                }
+                let path = schema_split
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to get flake path from URI {flake}"))?;
+                let mut path_split = path.split('/');
+                let org = path_split
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to get GitHub org from flake URL {flake}"))?;
+                let repo = path_split
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to get GitHub repo from flake URL {flake}"))?;
+                &format!("{org}/{repo}")
+            }
+        };
+
+        let repo_config = match repositories_cfg.get(repository_name) {
+            Some(c) => c,
+            None => {
+                return Err(anyhow!("repository not found in config: {repository_name}"));
+            }
+        };
+
+        let (eval_check_data, builds_checks_data) = get_check_data_for_jobset(
+            hydra_client,
+            hydra_project,
+            jobset_name,
+            &jobset,
+            &repo_config.check_run_name,
+            repo_config.check_per_job,
+        )
+        .await?;
+
+        let eval_is_completed =
+            matches!(eval_check_data.status, github::CheckRunStatus::Completed(_));
+
+        let all_checks = if let Some(mut builds_checks_data) = builds_checks_data {
+            builds_checks_data.push(eval_check_data);
+            builds_checks_data
+        } else {
+            vec![eval_check_data]
+        };
+
+        let installation_client = github_client.for_repo(repository_name).await?;
+
+        for check_data in all_checks {
+            github::upsert_check(
+                &installation_client,
+                app_id,
+                repository_name,
+                &commit_sha,
+                &check_data,
+            )
+            .await
+            .with_context(|| format!("failed to upsert check {}", check_data.name))?;
+            // TODO: don't fail on first error to upsert a check
+        }
+
+        // Clone the name if we need it later:
+        // it's part of jobset struct which is consumed in eval_is_completed branch
+        let repository_name = if repo_config.cancel_obsolete_builds {
+            repository_name.clone()
+        } else {
+            Default::default()
+        };
+
+        if eval_is_completed {
+            eprintln!("disabling jobset {jobset_name}");
+            hydra_client
+                .put_jobset(
+                    hydra_project,
+                    jobset_name,
+                    &hydra::Jobset {
+                        enabled: hydra::JobsetEnabled::Disabled,
+                        visible: false,
+                        ..jobset
+                    },
+                )
+                .await?;
+        }
+
+        if repo_config.cancel_obsolete_builds {
+            use std::collections::hash_map::Entry;
+            let entry = last_pr_commit_cache.entry((repository_name.clone(), pr_number));
+            let (pr_open, last_pr_commit) = match entry {
+                Entry::Occupied(e) => e.get().clone(),
+                Entry::Vacant(e) => {
+                    let pr = installation_client
+                        .get_client()
+                        .get_pull_request(&repository_name, pr_number)
+                        .await?;
+                    let commit_sha = pr.head.sha;
+                    let res = (
+                        matches!(pr.state, github::PullRequestState::Open),
+                        commit_sha.clone(),
+                    );
+                    e.insert(res.clone());
+                    res
+                }
+            };
+            if !pr_open || *last_pr_commit != commit_sha {
+                eprintln!("cancelling evals for jobset {jobset_name}");
+                let evals = hydra_client
+                    .get_jobset_evals(hydra_project, jobset_name)
+                    .await
+                    .context("failed to get evals to cancel")?;
+                for eval in evals {
+                    eprintln!("cancelling eval {}", eval.id);
+                    hydra_client.cancel_eval(eval.id).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn sync_hydra_jobsets(
         hydra_client: hydra::Client,
         github_client: github::ApplicationClient,
@@ -1825,8 +1971,8 @@ mod webhook {
         // TODO: keep a task per jobset in memory instead of looping
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            last_pr_commit_cache.clear();
             let _ = async {
-                last_pr_commit_cache.clear();
                 let project = hydra_client
                     .get_project(&hydra_project)
                     .await
@@ -1835,153 +1981,20 @@ mod webhook {
                     })?;
                 //eprintln!("got project {}: {project:?}", hydra_project);
                 for jobset_name in project.jobsets {
-                    let _ = async {
-                        let (pr_number, commit_sha) = match crate::parse_jobset_name(&jobset_name) {
-                            Some(x) => x,
-                            None => return Ok::<(), anyhow::Error>(()),
-                        };
-                        let jobset = hydra_client
-                            .get_jobset(&hydra_project, &jobset_name)
-                            .await?;
-                        if matches!(jobset.enabled, hydra::JobsetEnabled::Disabled)
-                            || !jobset.visible
-                        {
-                            return Ok(());
-                        }
-                        eprintln!("got jobset: {jobset_name}");
-
-                        let repository_name = match jobset.definition {
-                            hydra::JobsetDefinition::Legacy { ref inputs, .. } => {
-                                &inputs
-                                    .get("repository_name")
-                                    .ok_or_else(|| anyhow!("repository_name input not found"))?
-                                    .value
-                            }
-                            hydra::JobsetDefinition::Flake { ref flake } => {
-                                // flake jobsets don't have inputs, so we have to parse repo name from the flake URI
-                                let mut schema_split = flake.split(':');
-                                if schema_split.next().is_none_or(|s| s != "github") {
-                                    return Err(anyhow!("unexpected schema in flake URI {flake}"));
-                                }
-                                let path = schema_split.next().ok_or_else(|| {
-                                    anyhow!("failed to get flake path from URI {flake}")
-                                })?;
-                                let mut path_split = path.split('/');
-                                let org = path_split.next().ok_or_else(|| {
-                                    anyhow!("failed to get GitHub org from flake URL {flake}")
-                                })?;
-                                let repo = path_split.next().ok_or_else(|| {
-                                    anyhow!("failed to get GitHub repo from flake URL {flake}")
-                                })?;
-                                &format!("{org}/{repo}")
-                            }
-                        };
-
-                        let repo_config = match repositories_cfg.get(repository_name) {
-                            Some(c) => c,
-                            None => {
-                                return Err(anyhow!(
-                                    "repository not found in config: {repository_name}"
-                                ));
-                            }
-                        };
-
-                        let (eval_check_data, builds_checks_data) = get_check_data_for_jobset(
-                            &hydra_client,
-                            &hydra_project,
-                            &jobset_name,
-                            &jobset,
-                            &repo_config.check_run_name,
-                            repo_config.check_per_job,
-                        )
-                        .await?;
-
-                        let eval_is_completed =
-                            matches!(eval_check_data.status, github::CheckRunStatus::Completed(_));
-
-                        let all_checks = if let Some(mut builds_checks_data) = builds_checks_data {
-                            builds_checks_data.push(eval_check_data);
-                            builds_checks_data
-                        } else {
-                            vec![eval_check_data]
-                        };
-
-                        let installation_client = github_client.for_repo(repository_name).await?;
-
-                        for check_data in all_checks {
-                            github::upsert_check(
-                                &installation_client,
-                                app_id,
-                                repository_name,
-                                &commit_sha,
-                                &check_data,
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("failed to upsert check {}", check_data.name)
-                            })?;
-                            // TODO: don't fail on first error to upsert a check
-                        }
-
-                        // Clone the name if we need it later
-                        let repository_name = if repo_config.cancel_obsolete_builds {
-                            repository_name.clone()
-                        } else {
-                            Default::default()
-                        };
-
-                        if eval_is_completed {
-                            eprintln!("disabling jobset {jobset_name}");
-                            hydra_client
-                                .put_jobset(
-                                    &hydra_project,
-                                    &jobset_name,
-                                    &hydra::Jobset {
-                                        enabled: hydra::JobsetEnabled::Disabled,
-                                        visible: false,
-                                        ..jobset
-                                    },
-                                )
-                                .await?;
-                        }
-
-                        if repo_config.cancel_obsolete_builds {
-                            use std::collections::hash_map::Entry;
-                            let entry =
-                                last_pr_commit_cache.entry((repository_name.clone(), pr_number));
-                            let (pr_open, last_pr_commit) = match entry {
-                                Entry::Occupied(e) => e.get().clone(),
-                                Entry::Vacant(e) => {
-                                    let pr = installation_client
-                                        .get_client()
-                                        .get_pull_request(&repository_name, pr_number)
-                                        .await?;
-                                    let commit_sha = pr.head.sha;
-                                    let res = (
-                                        matches!(pr.state, github::PullRequestState::Open),
-                                        commit_sha.clone(),
-                                    );
-                                    e.insert(res.clone());
-                                    res
-                                }
-                            };
-                            if !pr_open || *last_pr_commit != commit_sha {
-                                eprintln!("cancelling evals for jobset {jobset_name}");
-                                let evals = hydra_client
-                                    .get_jobset_evals(&hydra_project, &jobset_name)
-                                    .await
-                                    .context("failed to get evals to cancel")?;
-                                for eval in evals {
-                                    eprintln!("cancelling eval {}", eval.id);
-                                    hydra_client.cancel_eval(eval.id).await?;
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
+                    if let Err(err) = sync_hydra_jobset(
+                        &hydra_client,
+                        &github_client,
+                        &hydra_project,
+                        app_id,
+                        &repositories_cfg,
+                        &mut last_pr_commit_cache,
+                        &jobset_name,
+                    )
                     .await
                     .with_context(|| format!("failed to process jobset {jobset_name}"))
-                    .inspect_err(|err| eprintln!("{err:?}"));
+                    {
+                        eprintln!("{err:?}");
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             }
