@@ -386,6 +386,7 @@ mod github {
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     pub struct UpsertCheckRunData {
+        pub name: String,
         #[serde(flatten)]
         pub status: CheckRunStatus,
         pub details_url: String,
@@ -751,13 +752,11 @@ mod github {
         pub async fn post_check_run(
             &self,
             repo_full_name: &str,
-            check_run_name: &str,
             head_sha: &str,
             data: &UpsertCheckRunData,
         ) -> Result<()> {
             #[derive(serde::Serialize)]
             struct Request<'a> {
-                name: &'a str,
                 head_sha: &'a str,
                 #[serde(flatten)]
                 data: &'a UpsertCheckRunData,
@@ -768,11 +767,7 @@ mod github {
                     "https://api.github.com/repos/{repo_full_name}/check-runs"
                 ))
                 .bearer_auth(&self.token)
-                .json(&Request {
-                    name: check_run_name,
-                    head_sha,
-                    data,
-                })
+                .json(&Request { head_sha, data })
                 .send()
                 .await
                 .with_context(|| {
@@ -790,13 +785,11 @@ mod github {
             &self,
             repo_full_name: &str,
             check_run_id: u64,
-            check_run_name: &str,
             head_sha: &str,
             data: &UpsertCheckRunData,
         ) -> Result<()> {
             #[derive(serde::Serialize)]
             struct Request<'a> {
-                name: &'a str,
                 head_sha: &'a str,
                 #[serde(flatten)]
                 data: &'a UpsertCheckRunData,
@@ -807,11 +800,7 @@ mod github {
                     "https://api.github.com/repos/{repo_full_name}/check-runs/{check_run_id}"
                 ))
                 .bearer_auth(&self.token)
-                .json(&Request {
-                    name: check_run_name,
-                    head_sha,
-                    data,
-                })
+                .json(&Request { head_sha, data })
                 .send()
                 .await
                 .with_context(|| {
@@ -969,7 +958,6 @@ mod github {
     pub async fn upsert_check(
         installation_client: &InstallationClient,
         app_id: u64,
-        check_run_name: &str,
         repo: &str,
         sha: &str,
         data: &UpsertCheckRunData,
@@ -978,16 +966,19 @@ mod github {
         let check_runs = installation_client
             .get_check_runs_for_commit(repo, app_id, sha)
             .await?;
+        let check_run_name = &data.name; // For logging only
         //eprintln!("got check runs: {check_runs:?}");
-        match check_runs.into_iter().find(|cr| {
-            cr.app.as_ref().is_some_and(|app| app.id == app_id) && cr.name == check_run_name
-        }) {
+        match check_runs
+            .into_iter()
+            .find(|cr| cr.app.as_ref().is_some_and(|app| app.id == app_id) && cr.name == data.name)
+        {
             Some(check_run) => {
                 eprintln!(
                     "found check run \"{check_run_name}\" for commit {sha} with id {}",
                     check_run.id
                 );
                 if (UpsertCheckRunData {
+                    name: check_run.name,
                     status: check_run.status,
                     details_url: check_run.details_url,
                     external_id: check_run.external_id,
@@ -1000,7 +991,7 @@ mod github {
                     return Ok(());
                 }
                 installation_client
-                    .patch_check_run(repo, check_run.id, check_run_name, sha, data)
+                    .patch_check_run(repo, check_run.id, sha, data)
                     .await?;
                 eprintln!(
                     "check run \"{check_run_name}\" for commit {sha} has been updated successfully"
@@ -1010,9 +1001,7 @@ mod github {
                 eprintln!(
                     "check run \"{check_run_name}\" for commit {sha} not found, will create a new one"
                 );
-                installation_client
-                    .post_check_run(repo, check_run_name, sha, data)
-                    .await?;
+                installation_client.post_check_run(repo, sha, data).await?;
                 eprintln!(
                     "check run \"{check_run_name}\" for commit {sha} has been created successfully"
                 );
@@ -1767,6 +1756,7 @@ mod webhook {
                             use github::CheckRunStatus::*;
 
                             let mut data = github::UpsertCheckRunData {
+                                name: repo_config.check_run_name.to_owned(),
                                 status: Queued,
                                 details_url: hydra_client.jobset_url(&hydra_project, &jobset_name),
                                 external_id: jobset_name.clone(),
@@ -1847,10 +1837,10 @@ mod webhook {
                                     github::upsert_check(
                                         &installation_client,
                                         app_id,
-                                        &build.job,
                                         repository_name,
                                         &commit_sha,
                                         &github::UpsertCheckRunData {
+                                            name: build.job,
                                             external_id: format!(
                                                 "{}:{}",
                                                 data.external_id, build.id
@@ -1898,7 +1888,6 @@ mod webhook {
                         github::upsert_check(
                             &installation_client,
                             app_id,
-                            &repo_config.check_run_name,
                             repository_name,
                             &commit_sha,
                             &eval_check_data,
@@ -2149,10 +2138,10 @@ mod webhook {
                 let _ = github::upsert_check(
                     &installation_client,
                     app_id,
-                    &repo_config.check_run_name,
                     repo_full_name,
                     &event.pull_request.head.sha,
                     &github::UpsertCheckRunData {
+                        name: repo_config.check_run_name.clone(),
                         status: github::CheckRunStatus::Queued,
                         details_url: hydra_client.jobset_url(&hydra_project, &jobset_id),
                         external_id: jobset_id,
