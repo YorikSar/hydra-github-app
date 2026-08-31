@@ -183,12 +183,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 
 
@@ -206,7 +212,10 @@ package
 
 
 *Default:*
-` pkgs.callPacakges ./package.nix `
+
+```nix
+pkgs.callPacakges ./package.nix
+```
 
 
 
@@ -224,7 +233,10 @@ submodule
 
 
 *Default:*
-` { } `
+
+```nix
+{ }
+```
 
 
 
@@ -346,7 +358,10 @@ non-empty string
 
 
 *Example:*
-` "127.0.0.1:3000" `
+
+```nix
+"127.0.0.1:3000"
+```
 
 
 
@@ -377,7 +392,10 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
@@ -419,6 +437,14 @@ JSON value
 
 
 
+*Default:*
+
+```nix
+null
+```
+
+
+
 ## services\.hydra-github-app\.settings\.user_agent
 
 
@@ -433,7 +459,10 @@ non-empty string
 
 
 *Example:*
-` "my-hydra-app" `
+
+```nix
+"my-hydra-app"
+```
 
 
 <!--end generated NixOS module documentation-->
