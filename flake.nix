@@ -48,6 +48,7 @@
           { system, pkgs }:
           {
             default = pkgs.callPackage ./package.nix { };
+            github-api-emulator = pkgs.callPackage ./tmp/default.nix { };
             nixosModuleDoc =
               (pkgs.nixosOptionsDoc {
                 options = nixpkgs.lib.removeAttrs modulesEval.options [ "_module" ];
