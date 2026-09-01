@@ -110,6 +110,11 @@ in
                     type = lib.types.bool;
                     default = false;
                   };
+                  cancel_obsolete_builds = lib.mkOption {
+                    description = "if enabled, all builds for older PR heads or for closed PRs will be cancelled";
+                    type = lib.types.bool;
+                    default = false;
+                  };
                   hydra_jobset_template = lib.mkOption {
                     description = ''
                       a representation of Hydra jobset configuration with following allowances:

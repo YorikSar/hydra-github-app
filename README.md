@@ -92,6 +92,7 @@ Configuration contains following fields:
 * `repositories` is an object with full names (`"ORG/REPO"`) of the GitHub repositories that are allowed to trigger Hydra builds as keys and following properties:
     * `check_run_name` is the name of the check representing the whole jobset that will be created on each commit.
     * `check_per_job` is a boolean flag, if it is enabled, every job in the jobset will be represented as a separate check named after its attribute path.
+    * `cancel_obsolete_builds` is a boolean flag, if it is enabled, all builds for older PR heads or for closed PRs will be cancelled
     * `hydra_jobset_template` is a representation of Hydra jobset configuration with following allowances:
         * `description` field can contain `{pr_url}` string that will be replaced with the URL of the PR that triggered this jobset;
         * `inputs` for legacy jobsets can contain inputs with no values with special types:
@@ -375,6 +376,27 @@ an object with full names (` "ORG/REPO" `) of the GitHub repositories that are a
 
 *Type:*
 attribute set of (submodule)
+
+
+
+## services\.hydra-github-app\.settings\.repositories\.\<name>\.cancel_obsolete_builds
+
+
+
+if enabled, all builds for older PR heads or for closed PRs will be cancelled
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
 
 
 
