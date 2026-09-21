@@ -1676,6 +1676,20 @@ mod webhook {
         assert_eq!(response.status(), 200);
     }
 
+    // Truncate string at a last character boundary not going over the provided length
+    //
+    // Can't use s[..len], because it'll panic if len is not on character boundary or less than
+    // string length.
+    // Can't use format!("{s:.len}"), because it will make a string of length at most len
+    // characters, not bytes.
+    fn truncate_string(s: &str, len: usize) -> &str {
+        #[allow(clippy::double_ended_iterator_last)]
+        match s.char_indices().filter(|(ind, _)| *ind <= len).last() {
+            Some((ind, _)) => &s[..ind],
+            None => s,
+        }
+    }
+
     async fn get_check_data_for_jobset(
         hydra_client: &hydra::Client,
         hydra_project: &str,
@@ -1705,8 +1719,11 @@ mod webhook {
             data.status = Completed(Failure);
             data.output = Some(github::CheckRunOutput {
                 title: "failed to evaluate".to_owned(),
-                // 65535 - 2*3 for tripple quotes - 2 for newlines
-                summary: format!("```\n{msg:.65527}\n```"),
+                // Total length must not exceed 65535
+                summary: format!(
+                    "```\n{}\n```",
+                    truncate_string(msg, 65535 - "```\n\n```".len())
+                ),
                 text: None,
             });
             return Ok((data, None));
@@ -1786,7 +1803,10 @@ mod webhook {
                                     "Build log is empty".to_owned()
                                 } else {
                                     // 65535 - 2*3 for tripple quotes - 2 for newlines
-                                    format!("```\n{logs:.65527}\n```")
+                                    format!(
+                                        "```\n{}\n```",
+                                        truncate_string(&logs, 65535 - "```\n\n```".len())
+                                    )
                                 }
                             }
                             None => "Build logs are not available".to_owned(),
