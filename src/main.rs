@@ -1821,10 +1821,32 @@ mod webhook {
             }
         }
 
-        data.status = if !all_finished {
-            InProgress
+        (data.status, data.output) = if !all_finished {
+            (
+                InProgress,
+                Some(github::CheckRunOutput {
+                    title: "builds are in progress...".to_owned(),
+                    ..Default::default()
+                }),
+            )
         } else {
-            Completed(if has_failures { Failure } else { Success })
+            if has_failures {
+                (
+                    Completed(Failure),
+                    Some(github::CheckRunOutput {
+                        title: "some builds have failed".to_owned(),
+                        ..Default::default()
+                    }),
+                )
+            } else {
+                (
+                    Completed(Success),
+                    Some(github::CheckRunOutput {
+                        title: "success".to_owned(),
+                        ..Default::default()
+                    }),
+                )
+            }
         };
         Ok((
             data,
