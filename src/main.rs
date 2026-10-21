@@ -1711,9 +1711,16 @@ mod webhook {
             external_id: jobset_name.to_owned(),
             output: None,
         };
+
+        let evals = hydra_client
+            .get_jobset_evals(hydra_project, jobset_name)
+            .await
+            .context("failed to get evals")?;
+
         if jobset.errortime.is_some()
             && let Some(msg) = jobset.errormsg.as_ref()
             && !msg.is_empty()
+            && evals.is_empty()
         {
             eprintln!("jobset {jobset_name} failed to evaluate");
             data.status = Completed(Failure);
@@ -1736,10 +1743,6 @@ mod webhook {
             });
             return Ok((data, None));
         }
-        let evals = hydra_client
-            .get_jobset_evals(hydra_project, jobset_name)
-            .await
-            .context("failed to get evals")?;
 
         let last_eval = match evals.first() {
             Some(eval) => eval,
