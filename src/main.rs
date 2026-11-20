@@ -1084,10 +1084,6 @@ mod hydra {
         pub value: String,
     }
 
-    fn return_false() -> bool {
-        false
-    }
-
     #[derive(serde_repr::Serialize_repr, serde_repr::Deserialize_repr)]
     #[repr(u8)]
     enum JobsetDefinitionType {
@@ -1170,7 +1166,6 @@ mod hydra {
     pub struct Jobset {
         #[serde(default)]
         pub enabled: JobsetEnabled,
-        #[serde(default = "return_false")]
         pub visible: bool,
         pub description: String,
         #[serde(flatten)]
@@ -1591,6 +1586,7 @@ async fn create_jobset_for_pr(
             _ => {}
         },
     }
+    jobset.visible = true;
     hydra_client
         .put_jobset(hydra_project, &jobset_id, &jobset)
         .await?;
